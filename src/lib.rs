@@ -1,3 +1,6 @@
+pub mod dashboards;
+pub mod graph;
+
 use ih_muse_proto::{
     metric_id_from_code, ElementKindRegistration, MetricDefinition, MetricPayload,
 };
@@ -22,6 +25,37 @@ pub const BATTERY_CHARGING_METRIC: &str = "host.battery.charging";
 pub const BATTERY_DRAIN_RATE_METRIC: &str = "host.battery.drain_percent_per_hour";
 pub const THERMAL_TEMPERATURE_METRIC: &str = "host.thermal.temperature_celsius";
 pub const PROCESS_CPU_USAGE_METRIC: &str = "process.cpu.usage_percent";
+pub const PROCESS_CPU_CAPACITY_METRIC: &str = "process.cpu.capacity_percent";
+pub const POET_CPU_SECONDS_METRIC: &str = "process.poet.runtime.cpu_seconds";
+pub const POET_UPTIME_SECONDS_METRIC: &str = "process.poet.runtime.uptime_seconds";
+pub const POET_CURRENT_RSS_METRIC: &str = "process.poet.runtime.current_rss_bytes";
+pub const POET_PEAK_RSS_METRIC: &str = "process.poet.runtime.peak_rss_bytes";
+pub const POET_HEALTH_AGE_METRIC: &str = "process.poet.health.sample_age_seconds";
+pub const POET_MANAGED_MEMORY_METRIC: &str = "process.poet.storage.managed_memory_bytes";
+pub const POET_QUEUE_BYTES_METRIC: &str = "process.poet.storage.queue_bytes";
+pub const POET_STORED_BYTES_METRIC: &str = "process.poet.storage.stored_bytes";
+pub const POET_SEGMENT_COUNT_METRIC: &str = "process.poet.storage.segment_count";
+pub const POET_COVERAGE_METRIC: &str = "process.poet.storage.coverage_ratio";
+pub const POET_REQUESTED_RESOLUTION_METRIC: &str =
+    "process.poet.storage.requested_resolution_nanoseconds";
+pub const POET_EFFECTIVE_RESOLUTION_METRIC: &str =
+    "process.poet.storage.effective_resolution_nanoseconds";
+pub const POET_REQUESTED_HORIZON_METRIC: &str =
+    "process.poet.storage.requested_horizon_nanoseconds";
+pub const POET_EFFECTIVE_HORIZON_METRIC: &str =
+    "process.poet.storage.effective_horizon_nanoseconds";
+pub const POET_DERIVATION_LAG_METRIC: &str = "process.poet.storage.derivation_lag_nanoseconds";
+pub const POET_DELIVERY_ACCEPTED_METRIC: &str = "process.poet.delivery.accepted";
+pub const POET_DELIVERY_REJECTED_METRIC: &str = "process.poet.delivery.rejected";
+pub const POET_DELIVERY_DROPPED_METRIC: &str = "process.poet.delivery.dropped";
+pub const POET_DELIVERY_FAILED_METRIC: &str = "process.poet.delivery.failed";
+pub const POET_DELIVERY_UNKNOWN_METRIC: &str = "process.poet.delivery.unknown";
+
+/// Converts one-core percentages into a share of the machine's logical CPU capacity.
+pub fn cpu_capacity_percent(core_percent: f32, logical_cpus: usize) -> Option<f32> {
+    (logical_cpus > 0 && core_percent.is_finite() && core_percent >= 0.0)
+        .then(|| (core_percent / logical_cpus as f32).min(100.0))
+}
 pub const PROCESS_MEMORY_BYTES_METRIC: &str = "process.memory.rss_bytes";
 pub const PROCESS_DISK_READ_BYTES_METRIC: &str = "process.disk.read_bytes_delta";
 pub const PROCESS_DISK_WRITE_BYTES_METRIC: &str = "process.disk.write_bytes_delta";
@@ -74,7 +108,7 @@ impl HostSnapshot {
             element_id,
             &[
                 MetricReading::new(MEMORY_USAGE_METRIC, self.memory_usage_percent)?,
-                MetricReading::new(MEMORY_USED_BYTES_METRIC, self.used_memory_bytes as f32)?,
+                MetricReading::new(MEMORY_USED_BYTES_METRIC, self.used_memory_bytes as f64)?,
             ],
         )
     }
@@ -85,7 +119,7 @@ impl HostSnapshot {
             element_id,
             &[
                 MetricReading::new(SWAP_USAGE_METRIC, self.swap_usage_percent)?,
-                MetricReading::new(SWAP_USED_BYTES_METRIC, self.used_swap_bytes as f32)?,
+                MetricReading::new(SWAP_USED_BYTES_METRIC, self.used_swap_bytes as f64)?,
             ],
         )
     }
@@ -104,10 +138,10 @@ impl HostSnapshot {
             element_id,
             &[
                 MetricReading::new(DISK_USAGE_METRIC, self.disk_usage_percent)?,
-                MetricReading::new(DISK_USED_BYTES_METRIC, self.used_disk_bytes as f32)?,
+                MetricReading::new(DISK_USED_BYTES_METRIC, self.used_disk_bytes as f64)?,
                 MetricReading::new(
                     DISK_AVAILABLE_BYTES_METRIC,
-                    self.available_disk_bytes as f32,
+                    self.available_disk_bytes as f64,
                 )?,
             ],
         )
@@ -121,15 +155,73 @@ pub struct BatterySnapshot {
     pub charging: bool,
 }
 
+/// One named sample. `f64`, so byte counters stay exact up to 2^53.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MetricReading {
     pub code: &'static str,
-    pub value: f32,
+    pub value: f64,
 }
 
 impl MetricReading {
-    pub fn new(code: &'static str, value: f32) -> Option<Self> {
+    pub fn new(code: &'static str, value: impl Into<f64>) -> Option<Self> {
+        let value = value.into();
         value.is_finite().then_some(Self { code, value })
+    }
+}
+
+/// Samples that were collected but not yet acknowledged by Poet.
+///
+/// A failed send keeps the sample (with its original timestamps) for the next
+/// attempt instead of dropping it. The queue is bounded: past `max_samples` the
+/// oldest sample is discarded and counted in `dropped_samples`.
+#[derive(Debug)]
+pub struct PendingSamples<T = Vec<MetricPayload>> {
+    queue: std::collections::VecDeque<T>,
+    max_samples: usize,
+    dropped_samples: u64,
+}
+
+impl<T> PendingSamples<T> {
+    pub fn new(max_samples: usize) -> Self {
+        Self {
+            queue: std::collections::VecDeque::new(),
+            max_samples: max_samples.max(1),
+            dropped_samples: 0,
+        }
+    }
+
+    /// Queues one sample; returns how many old samples were dropped.
+    pub fn push(&mut self, sample: T) -> u64 {
+        self.queue.push_back(sample);
+        let mut dropped = 0;
+        while self.queue.len() > self.max_samples {
+            self.queue.pop_front();
+            dropped += 1;
+        }
+        self.dropped_samples += dropped;
+        dropped
+    }
+
+    /// The oldest unsent sample.
+    pub fn oldest(&self) -> Option<&T> {
+        self.queue.front()
+    }
+
+    /// Marks the oldest sample as acknowledged.
+    pub fn acknowledge_oldest(&mut self) {
+        self.queue.pop_front();
+    }
+
+    pub fn len(&self) -> usize {
+        self.queue.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.queue.is_empty()
+    }
+
+    pub fn dropped_samples(&self) -> u64 {
+        self.dropped_samples
     }
 }
 
@@ -153,7 +245,27 @@ pub fn metric_payload(
 }
 
 pub fn metric_definitions() -> Vec<MetricDefinition> {
-    vec![
+    let mut definitions = vec![
+        poet_metric(POET_CPU_SECONDS_METRIC, "Poet CPU time", "Cumulative CPU time used by this Poet process", "seconds"),
+        poet_metric(POET_UPTIME_SECONDS_METRIC, "Poet uptime", "Elapsed time in this Poet process lifetime", "seconds"),
+        poet_metric(POET_CURRENT_RSS_METRIC, "Poet current memory", "Current resident memory used by this Poet process", "bytes"),
+        poet_metric(POET_PEAK_RSS_METRIC, "Poet peak memory", "Peak resident memory in this Poet process lifetime", "bytes"),
+        poet_metric(POET_HEALTH_AGE_METRIC, "Poet health freshness", "Age of the sampled Poet health report", "seconds"),
+        poet_metric(POET_MANAGED_MEMORY_METRIC, "Poet managed memory", "Memory directly accounted by the native Poet store", "bytes"),
+        poet_metric(POET_QUEUE_BYTES_METRIC, "Poet queued storage", "Native storage bytes awaiting derivation or compaction", "bytes"),
+        poet_metric(POET_STORED_BYTES_METRIC, "Poet stored data", "Bytes retained across native Poet storage roots", "bytes"),
+        poet_metric(POET_SEGMENT_COUNT_METRIC, "Poet segments", "Committed native storage segment count", "number"),
+        poet_metric(POET_COVERAGE_METRIC, "Poet coverage", "Fraction of expected retained observations currently available", "ratio"),
+        poet_metric(POET_REQUESTED_RESOLUTION_METRIC, "Poet requested resolution", "Configured finest retained resolution", "nanoseconds"),
+        poet_metric(POET_EFFECTIVE_RESOLUTION_METRIC, "Poet effective resolution", "Finest resolution currently retained after pressure actions", "nanoseconds"),
+        poet_metric(POET_REQUESTED_HORIZON_METRIC, "Poet requested horizon", "Configured duration of retained history", "nanoseconds"),
+        poet_metric(POET_EFFECTIVE_HORIZON_METRIC, "Poet effective horizon", "History duration currently retained after pressure actions", "nanoseconds"),
+        poet_metric(POET_DERIVATION_LAG_METRIC, "Poet derivation lag", "Time between durable source data and its materialized views", "nanoseconds"),
+        poet_metric(POET_DELIVERY_ACCEPTED_METRIC, "Poet accepted deliveries", "Records accepted by native Poet storage", "number"),
+        poet_metric(POET_DELIVERY_REJECTED_METRIC, "Poet rejected deliveries", "Records rejected before durable acknowledgement", "number"),
+        poet_metric(POET_DELIVERY_DROPPED_METRIC, "Poet dropped deliveries", "Accepted records later reported as dropped", "number"),
+        poet_metric(POET_DELIVERY_FAILED_METRIC, "Poet failed deliveries", "Accepted records whose durable processing failed", "number"),
+        poet_metric(POET_DELIVERY_UNKNOWN_METRIC, "Poet unknown deliveries", "Records whose final delivery outcome is unknown", "number"),
         MetricDefinition::new(CPU_USAGE_METRIC, "CPU usage", "Host CPU usage percentage"),
         MetricDefinition::new(
             CPU_CORE_USAGE_METRIC,
@@ -243,8 +355,13 @@ pub fn metric_definitions() -> Vec<MetricDefinition> {
         ),
         MetricDefinition::new(
             PROCESS_CPU_USAGE_METRIC,
+            "Process CPU (core %)",
+            "100 percent is one logical CPU; this can exceed 100 on multicore hosts",
+        ),
+        MetricDefinition::new(
+            PROCESS_CPU_CAPACITY_METRIC,
             "Process CPU",
-            "Process CPU usage percentage",
+            "Share of machine logical CPU capacity; collected processes may not cover all host activity",
         ),
         MetricDefinition::new(
             PROCESS_MEMORY_BYTES_METRIC,
@@ -271,7 +388,62 @@ pub fn metric_definitions() -> Vec<MetricDefinition> {
             "Process network transmitted",
             "Process network bytes transmitted since the previous sample when available",
         ),
-    ]
+    ];
+    for definition in &mut definitions {
+        if let Some(display) = &mut definition.display {
+            let kind = if definition.code.starts_with("process.") {
+                KIND_MACOS_PROCESS
+            } else if definition.code.contains(".core_") {
+                KIND_MACOS_CPU_CORE
+            } else if definition.code.contains(".disk.") {
+                KIND_MACOS_DISK_VOLUME
+            } else if definition.code.contains(".network.") {
+                KIND_MACOS_NETWORK_INTERFACE
+            } else if definition.code.contains(".battery.") {
+                KIND_MACOS_POWER_SOURCE
+            } else if definition.code.contains(".thermal.") {
+                KIND_MACOS_THERMAL_SENSOR
+            } else {
+                KIND_MACOS_RESOURCE
+            };
+            display.element_kinds = if definition.code.starts_with("process.") {
+                // Process metrics are also published as additive application
+                // summaries, so the same metric supports parent/child zoom.
+                vec![KIND_MACOS_APPLICATION.into(), KIND_MACOS_PROCESS.into()]
+            } else {
+                vec![kind.into()]
+            };
+            display.direction = if definition.code.ends_with("charge_percent")
+                || definition.code.ends_with("available_bytes")
+            {
+                "lower_is_worse"
+            } else if definition.code.ends_with("celsius")
+                || definition.code.ends_with("usage_percent")
+            {
+                "higher_is_worse"
+            } else {
+                "neutral"
+            }
+            .into();
+        }
+    }
+    definitions
+}
+
+fn poet_metric(code: &str, name: &str, description: &str, unit: &str) -> MetricDefinition {
+    let mut definition = MetricDefinition::new(code, name, description);
+    if let Some(display) = &mut definition.display {
+        display.unit = unit.into();
+        display.aggregation = "none".into();
+        display.kind = if code == POET_CPU_SECONDS_METRIC || code.contains(".delivery.") {
+            "counter"
+        } else {
+            "gauge"
+        }
+        .into();
+        display.element_kinds = vec![KIND_MACOS_PROCESS.into()];
+    }
+    definition
 }
 
 pub fn element_kind_definitions() -> Vec<ElementKindRegistration> {
@@ -394,6 +566,44 @@ fn percentage(numerator: u64, denominator: u64) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pending_samples_keep_unsent_data_in_order_and_bound_memory() {
+        let payload = |time| vec![MetricPayload::new(time, 1, vec![1], vec![Some(1.0)])];
+        let mut pending = PendingSamples::new(2);
+        assert_eq!(pending.push(payload(1)), 0);
+        assert_eq!(pending.push(payload(2)), 0);
+        assert_eq!(pending.push(payload(3)), 1);
+        assert_eq!(pending.dropped_samples(), 1);
+        assert_eq!(pending.oldest().unwrap()[0].time, 2);
+        pending.acknowledge_oldest();
+        assert_eq!(pending.oldest().unwrap()[0].time, 3);
+        pending.acknowledge_oldest();
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn readings_keep_byte_counters_exact() {
+        let bytes = 16_777_217_u64; // 2^24 + 1 is not representable in f32
+        let reading = MetricReading::new("memory_used_bytes", bytes as f64).unwrap();
+        assert_eq!(reading.value, 16_777_217.0);
+    }
+
+    #[test]
+    fn every_metric_declares_units_and_measured_element_kind() {
+        for metric in metric_definitions() {
+            let display = metric.display.unwrap();
+            assert!(!display.unit.is_empty());
+            if metric.code.starts_with("process.") {
+                assert_eq!(
+                    display.element_kinds,
+                    vec![KIND_MACOS_APPLICATION, KIND_MACOS_PROCESS]
+                );
+            } else {
+                assert_eq!(display.element_kinds.len(), 1);
+            }
+        }
+    }
     use ih_muse_proto::metric_id_from_code;
 
     #[test]
@@ -455,5 +665,14 @@ mod tests {
                 charging: false,
             })
         );
+    }
+
+    #[test]
+    fn process_cpu_capacity_preserves_core_units_and_rejects_unknown_capacity() {
+        assert_eq!(cpu_capacity_percent(400.0, 12), Some(400.0 / 12.0));
+        assert_eq!(cpu_capacity_percent(0.0, 12), Some(0.0));
+        assert_eq!(cpu_capacity_percent(400.0, 0), None);
+        assert_eq!(cpu_capacity_percent(f32::NAN, 12), None);
+        assert_eq!(cpu_capacity_percent(-1.0, 12), None);
     }
 }

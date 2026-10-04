@@ -9,6 +9,7 @@ description = "A small macOS host-metrics producer for Infinite Haiku"
 anyhow = "1"
 reqwest = { version = "=0.12.8", features = ["json", "native-tls"] }
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 clap = { version = "4.5", features = ["derive", "env"] }
 ih-muse-client = { path = "../ih-muse/crates/ih-muse-client" }
 ih-muse-core = { path = "../ih-muse/crates/ih-muse-core" }

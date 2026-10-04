@@ -740,6 +740,7 @@ dependencies = [
  "ih-muse-proto",
  "reqwest",
  "serde",
+ "serde_json",
  "serde_with",
  "sysinfo",
  "time",

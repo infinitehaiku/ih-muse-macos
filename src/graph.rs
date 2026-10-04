@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use ih_muse_proto::{
     metric_id_from_code, AggregationTemporality, AttributeValue, Entity, EntityIdentity,
-    EntityKey, GraphBatch, GraphIntakeRequest, InstrumentationScope, JoinStatus, MetricDefinition,
+    DashboardDefinition, EntityKey, GraphBatch, GraphIntakeRequest, InstrumentationScope, JoinStatus, MetricDefinition,
     MetricDescriptor, MetricDisplay, MetricId, MetricInstrument, MetricObservation, MetricPayload,
     MetricUnit, Number, Observation, OrganizationId, Provenance, RelationKind, SpatialAggregation,
     TemporalRelation, TimeRange, TypedMetricValue, UnitDisplay, ValueDomain,
@@ -41,6 +41,10 @@ pub struct GraphRegistry {
     ids: HashMap<String, u64>,
     elements: HashMap<u64, ElementInfo>,
     descriptors: HashMap<MetricId, MetricDescriptor>,
+    /// This Muse's dashboard definitions, attached to every intake until a
+    /// Poet acknowledges one batch that carried them (then left out).
+    dashboards: Vec<DashboardDefinition>,
+    dashboards_delivered: bool,
 }
 
 impl GraphRegistry {
@@ -54,6 +58,18 @@ impl GraphRegistry {
                 .iter()
                 .map(|definition| (metric_id_from_code(&definition.code), descriptor(definition)))
                 .collect(),
+            dashboards: crate::dashboards::dashboard_definitions(),
+            dashboards_delivered: false,
+        }
+    }
+
+    /// Records that a Poet acknowledged `request`. Once a batch that carried
+    /// the dashboard definitions is acknowledged, later intakes leave them out
+    /// until the process restarts (they are static per Muse version, and the
+    /// Poets of a cluster replicate them among themselves).
+    pub fn acknowledge(&mut self, request: &GraphIntakeRequest) {
+        if !request.batch.dashboards.is_empty() {
+            self.dashboards_delivered = true;
         }
     }
 
@@ -192,11 +208,16 @@ impl GraphRegistry {
             events: Vec::new(),
             derivations: Vec::new(),
             availability: Vec::new(),
+            dashboards: Vec::new(),
         }
     }
 
     /// The intake request for one sample. Its delivery id depends only on the
     /// host and the sample time, so a retry (to any Poet) is stored once.
+    /// It carries the dashboard definitions until one such batch is
+    /// acknowledged ([`Self::acknowledge`]): normally only the first batch
+    /// after start, and every queued batch while no Poet is reachable, so a
+    /// dropped or failed first batch cannot lose them.
     pub fn intake(&self, sample_time_micros: i64, payloads: &[MetricPayload], observed_at_unix_nano: u64) -> GraphIntakeRequest {
         GraphIntakeRequest {
             schema_version: GRAPH_INTAKE_SCHEMA_VERSION,
@@ -204,7 +225,10 @@ impl GraphRegistry {
             delivery_id: format!("{SOURCE_ID}:{}:{sample_time_micros}", self.host_id),
             organization: self.organization.clone(),
             owner_id: self.organization.clone(),
-            batch: self.batch(payloads, observed_at_unix_nano),
+            batch: GraphBatch {
+                dashboards: if self.dashboards_delivered { Vec::new() } else { self.dashboards.clone() },
+                ..self.batch(payloads, observed_at_unix_nano)
+            },
         }
     }
 }
@@ -315,5 +339,27 @@ mod tests {
         ));
         assert_eq!(descriptor(find(CPU_USAGE_METRIC)).instrument, MetricInstrument::Gauge);
         assert_eq!(descriptor(find(CPU_USAGE_METRIC)).unit.ucum, "%");
+    }
+
+    #[test]
+    fn dashboards_ride_the_first_batch_until_a_poet_acknowledges_one() {
+        let (mut registry, _, cpu, _) = registry();
+        let payload = |time| vec![MetricPayload::new(time, cpu, vec![metric_id_from_code(CPU_USAGE_METRIC)], vec![Some(1.0)])];
+        let first = registry.intake(1_000_000, &payload(1_000_000), 1);
+        first.validate().expect("a batch with definitions is valid");
+        assert_eq!(first.batch.dashboards, crate::dashboards::dashboard_definitions());
+        // No Poet reachable yet: the next queued batch carries them too, so a
+        // dropped first batch cannot lose them.
+        let queued = registry.intake(2_000_000, &payload(2_000_000), 2);
+        assert_eq!(queued.batch.dashboards, first.batch.dashboards);
+        // A batch without definitions being acknowledged changes nothing.
+        let mut plain = queued.clone();
+        plain.batch.dashboards.clear();
+        registry.acknowledge(&plain);
+        assert!(!registry.intake(3_000_000, &payload(3_000_000), 3).batch.dashboards.is_empty());
+        registry.acknowledge(&first);
+        let later = registry.intake(4_000_000, &payload(4_000_000), 4);
+        assert!(later.batch.dashboards.is_empty(), "sent once per start");
+        assert!(!serde_json::to_string(&later).unwrap().contains("dashboards"), "later batches keep their old bytes");
     }
 }

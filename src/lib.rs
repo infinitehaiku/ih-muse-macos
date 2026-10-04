@@ -1,3 +1,4 @@
+pub mod dashboards;
 pub mod graph;
 
 use ih_muse_proto::{

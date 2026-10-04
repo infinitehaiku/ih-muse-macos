@@ -141,7 +141,7 @@ async fn main() -> Result<()> {
                 pending.dropped_samples()
             );
         }
-        if let Err(error) = send_pending(&client, &mut pending).await {
+        if let Err(error) = send_pending(&client, &mut registry, &mut pending).await {
             eprintln!(
                 "Poet send failed; {} sample(s) queued for retry: {error:#}",
                 pending.len()
@@ -167,7 +167,7 @@ async fn main() -> Result<()> {
         );
 
         if sample_limit.is_some_and(|limit| samples_sent >= limit) {
-            send_pending(&client, &mut pending).await?;
+            send_pending(&client, &mut registry, &mut pending).await?;
             return Ok(());
         }
     }
@@ -1108,11 +1108,13 @@ fn publish_snapshot(
 /// stays queued for the next tick. Returns how many samples were sent.
 async fn send_pending(
     client: &GraphPoetClient,
+    registry: &mut ElementRegistry,
     pending: &mut PendingSamples<GraphIntakeRequest>,
 ) -> Result<usize> {
     let mut sent = 0;
     while let Some(request) = pending.oldest() {
         client.publish(request).await?;
+        registry.acknowledge(request);
         pending.acknowledge_oldest();
         sent += 1;
     }

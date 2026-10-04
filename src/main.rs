@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
@@ -32,6 +32,7 @@ use ih_muse_macos::{
 };
 
 const DEFAULT_TOP_PROCESSES: usize = 40;
+const DEFAULT_PROCESS_HOLD_SAMPLES: u32 = 30;
 
 /// Collector endpoint, sampling cadence, and optional sampling features.
 #[derive(Debug, Parser)]
@@ -57,6 +58,14 @@ struct Args {
         default_value_t = DEFAULT_TOP_PROCESSES
     )]
     top_processes: usize,
+    /// Samples a process stays emitted after it leaves the top ranking, so
+    /// its series does not flicker while it still exists.
+    #[arg(
+        long,
+        env = "IH_MUSE_PROCESS_HOLD_SAMPLES",
+        default_value_t = DEFAULT_PROCESS_HOLD_SAMPLES
+    )]
+    process_hold_samples: u32,
     #[arg(
         long,
         env = "IH_MUSE_PROCESS_NETWORK",
@@ -89,7 +98,10 @@ async fn main() -> Result<()> {
 
     let mut registry = ElementRegistry::new(&args.organization, hostname(), &metric_definitions());
     let static_elements = register_static_elements(&mut registry);
-    let mut sampler = Sampler::new();
+    let mut sampler = Sampler::new(ProcessSelector::new(
+        args.top_processes,
+        args.process_hold_samples,
+    ));
     let sample_limit = args.samples.or_else(|| args.once.then_some(1));
     let mut samples_sent = 0;
     let mut pending = PendingSamples::<GraphIntakeRequest>::new(MAX_PENDING_SAMPLES);
@@ -114,7 +126,7 @@ async fn main() -> Result<()> {
     loop {
         cadence.tick().await;
         let snapshot_time = timestamp();
-        let mut snapshot = sampler.collect(snapshot_time, args.top_processes, args.process_network);
+        let mut snapshot = sampler.collect(snapshot_time, args.process_network);
         snapshot.poet_health =
             collect_poet_health(&telemetry_client, client.preferred_endpoint(), poet_token.as_deref()).await;
         // A Poet restart or network error must not stop the Muse or lose the
@@ -138,11 +150,12 @@ async fn main() -> Result<()> {
 
         samples_sent += 1;
         println!(
-            "sample {} at {}: {} payloads, {} processes, {} disks, {} interfaces, {} sensors, battery {}",
+            "sample {} at {}: {} payloads, {} processes ({} emitted), {} disks, {} interfaces, {} sensors, battery {}",
             samples_sent,
             published.timestamp,
             published.payload_count,
             snapshot.processes.len(),
+            snapshot.emitted_processes.len(),
             snapshot.disks.len(),
             snapshot.network_interfaces.len(),
             snapshot.thermal_sensors.len(),
@@ -254,8 +267,10 @@ fn ensure_group(registry: &mut ElementRegistry, host_id: u64, name: &str, key: &
         )
 }
 
-/// Retains OS sampling state needed to compute deltas between observations.
+/// Retains OS sampling state needed to compute deltas between observations,
+/// plus the process selector whose hold state spans samples.
 struct Sampler {
+    process_selector: ProcessSelector,
     system: System,
     disks: Disks,
     networks: Networks,
@@ -265,7 +280,7 @@ struct Sampler {
 }
 
 impl Sampler {
-    fn new() -> Self {
+    fn new(process_selector: ProcessSelector) -> Self {
         let mut system = System::new_all();
         system.refresh_cpu_all();
         system.refresh_memory();
@@ -279,6 +294,7 @@ impl Sampler {
         components.refresh();
 
         Self {
+            process_selector,
             system,
             disks,
             networks,
@@ -291,7 +307,6 @@ impl Sampler {
     fn collect(
         &mut self,
         now: i64,
-        top_processes: usize,
         process_network_enabled: bool,
     ) -> CollectedSnapshot {
         self.system.refresh_cpu_all();
@@ -308,6 +323,8 @@ impl Sampler {
         let thermal_sensors = collect_thermal_sensors(&self.components);
         let battery = self.battery_reading(now);
         let process_network = self.collect_process_network(process_network_enabled);
+        let processes = collect_processes(&self.system, &process_network);
+        let emitted_processes = self.process_selector.select(&processes);
 
         CollectedSnapshot {
             poet_health: None,
@@ -338,7 +355,8 @@ impl Sampler {
             network_interfaces,
             battery,
             thermal_sensors,
-            processes: collect_processes(&self.system, top_processes, &process_network),
+            processes,
+            emitted_processes,
         }
     }
 
@@ -379,6 +397,8 @@ impl Sampler {
 }
 
 /// One collection pass before dynamic element registration and publication.
+/// `processes` holds every sampled process (application totals are summed
+/// over all of them); `emitted_processes` holds the keys published as leaves.
 struct CollectedSnapshot {
     poet_health: Option<PoetHealthSample>,
     host: ih_muse_macos::HostSnapshot,
@@ -388,6 +408,7 @@ struct CollectedSnapshot {
     battery: Option<BatteryReading>,
     thermal_sensors: Vec<ThermalSensorSample>,
     processes: Vec<ProcessSample>,
+    emitted_processes: HashSet<String>,
 }
 
 /// Bounded, authenticated self-health returned by the observed Poet process.
@@ -683,17 +704,21 @@ struct RegisteredSnapshotElements {
     network_interface_ids: Vec<u64>,
     battery_id: Option<u64>,
     thermal_sensor_ids: Vec<u64>,
-    processes: Vec<RegisteredProcess>,
+    applications: Vec<RegisteredApplication>,
 }
 
-/// Poet IDs for a process leaf and its stable application parent.
-struct RegisteredProcess {
+/// Poet IDs for one application, its emitted process leaves (aligned with
+/// [`ApplicationPlan::emitted`]) and its optional "other processes" child.
+struct RegisteredApplication {
     application_id: u64,
-    process_id: u64,
+    process_ids: Vec<u64>,
+    other_id: Option<u64>,
 }
 
-#[derive(Default)]
-/// Additive resource observations for the sampled processes of one application.
+#[derive(Clone, Debug, Default, PartialEq)]
+/// Additive resource observations for a set of processes (an application,
+/// or the un-emitted remainder of one). Network sums are present only when
+/// at least one summed process had a network observation.
 struct ApplicationTotals {
     cpu_usage_percent: f32,
     memory_bytes: u64,
@@ -722,6 +747,157 @@ impl ApplicationTotals {
             self.has_network_transmitted = true;
         }
     }
+
+    /// The totals of a single process.
+    fn of(process: &ProcessSample) -> Self {
+        let mut totals = Self::default();
+        totals.add(process);
+        totals
+    }
+
+    /// Process metric readings for these totals; absent network stays absent.
+    fn readings(&self, logical_cpus: usize) -> [Option<MetricReading>; 7] {
+        [
+            MetricReading::new(PROCESS_CPU_USAGE_METRIC, self.cpu_usage_percent),
+            ih_muse_macos::cpu_capacity_percent(self.cpu_usage_percent, logical_cpus)
+                .and_then(|value| MetricReading::new(ih_muse_macos::PROCESS_CPU_CAPACITY_METRIC, value)),
+            MetricReading::new(PROCESS_MEMORY_BYTES_METRIC, self.memory_bytes as f64),
+            MetricReading::new(PROCESS_DISK_READ_BYTES_METRIC, self.disk_read_bytes as f64),
+            MetricReading::new(PROCESS_DISK_WRITE_BYTES_METRIC, self.disk_write_bytes as f64),
+            self.has_network_received
+                .then(|| {
+                    MetricReading::new(
+                        ih_muse_macos::PROCESS_NETWORK_RECEIVED_BYTES_METRIC,
+                        self.network_received_bytes as f64,
+                    )
+                })
+                .flatten(),
+            self.has_network_transmitted
+                .then(|| {
+                    MetricReading::new(
+                        ih_muse_macos::PROCESS_NETWORK_TRANSMITTED_BYTES_METRIC,
+                        self.network_transmitted_bytes as f64,
+                    )
+                })
+                .flatten(),
+        ]
+    }
+}
+
+/// One application for one sample: totals over ALL of its sampled processes,
+/// the processes emitted as leaves (in rank order), and the remainder of the
+/// un-emitted ones, so the children always sum to the application total.
+struct ApplicationPlan<'a> {
+    app_key: &'a str,
+    app_name: &'a str,
+    totals: ApplicationTotals,
+    emitted: Vec<&'a ProcessSample>,
+    other: Option<OtherProcesses>,
+}
+
+/// Resource sums of an application's processes that are not emitted as leaves.
+#[derive(Debug, PartialEq)]
+struct OtherProcesses {
+    count: usize,
+    totals: ApplicationTotals,
+}
+
+/// Stable graph key of an application's "other processes" child.
+fn other_processes_key(app_key: &str) -> String {
+    format!("{app_key}:other")
+}
+
+/// Groups every sampled process by application (ordered by key). An
+/// application exists in the plan whenever any of its processes exists.
+fn plan_applications<'a>(
+    processes: &'a [ProcessSample],
+    emitted: &HashSet<String>,
+) -> Vec<ApplicationPlan<'a>> {
+    let mut plans = BTreeMap::<&str, ApplicationPlan<'a>>::new();
+    for process in processes {
+        let plan = plans
+            .entry(process.app_key.as_str())
+            .or_insert_with(|| ApplicationPlan {
+                app_key: &process.app_key,
+                app_name: &process.app_name,
+                totals: ApplicationTotals::default(),
+                emitted: Vec::new(),
+                other: None,
+            });
+        plan.totals.add(process);
+        if emitted.contains(&process.key) {
+            plan.emitted.push(process);
+        } else {
+            let other = plan.other.get_or_insert_with(|| OtherProcesses {
+                count: 0,
+                totals: ApplicationTotals::default(),
+            });
+            other.count += 1;
+            other.totals.add(process);
+        }
+    }
+    plans.into_values().collect()
+}
+
+/// Chooses which processes are emitted as individual leaves: the top `top`
+/// by [`process_score`], plus any process that was in the top within the last
+/// `hold_samples` samples and still exists (bounded to `2 × top` overall),
+/// plus the always-observed `poet` and `ih-muse-macos`. State is keyed by the
+/// process key (pid + start time), so a reused pid is a new process.
+struct ProcessSelector {
+    top: usize,
+    hold_samples: u32,
+    /// Remaining hold samples per process key, refreshed while in the top.
+    held: HashMap<String, u32>,
+}
+
+impl ProcessSelector {
+    fn new(top: usize, hold_samples: u32) -> Self {
+        Self {
+            top: top.max(1),
+            hold_samples,
+            held: HashMap::new(),
+        }
+    }
+
+    /// Selects the emitted process keys for this sample and advances holds.
+    fn select(&mut self, processes: &[ProcessSample]) -> HashSet<String> {
+        let mut ranked = processes.iter().collect::<Vec<_>>();
+        ranked.sort_by(|left, right| {
+            process_score(right)
+                .partial_cmp(&process_score(left))
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| left.name.cmp(&right.name))
+                .then_with(|| left.pid.cmp(&right.pid))
+        });
+        let bound = self.top.saturating_mul(2);
+        let mut emitted = HashSet::new();
+        let mut held = HashMap::new();
+        for (rank, process) in ranked.iter().enumerate() {
+            if rank < self.top {
+                emitted.insert(process.key.clone());
+                if self.hold_samples > 0 {
+                    held.insert(process.key.clone(), self.hold_samples);
+                }
+            } else if let Some(remaining) = self.held.get(&process.key).copied() {
+                if remaining > 0 && emitted.len() < bound {
+                    emitted.insert(process.key.clone());
+                    if remaining > 1 {
+                        held.insert(process.key.clone(), remaining - 1);
+                    }
+                }
+            }
+            if is_self_observed(&process.name) {
+                emitted.insert(process.key.clone());
+            }
+        }
+        self.held = held;
+        emitted
+    }
+}
+
+fn is_self_observed(name: &str) -> bool {
+    matches!(name, "poet" | "ih-muse-macos")
 }
 
 #[test]
@@ -772,7 +948,8 @@ fn publish_snapshot(
     static_elements: &StaticElements,
     snapshot: &CollectedSnapshot,
 ) -> PublishedSample {
-    let registered = ensure_snapshot_elements(registry, static_elements, snapshot);
+    let applications = plan_applications(&snapshot.processes, &snapshot.emitted_processes);
+    let registered = ensure_snapshot_elements(registry, static_elements, snapshot, &applications);
     let now = timestamp();
     let mut payloads = Vec::new();
     if let Some(payload) = snapshot.host.cpu_metrics(now, static_elements.total_cpu_id) {
@@ -887,98 +1064,36 @@ fn publish_snapshot(
         );
     }
 
-    let mut applications = BTreeMap::<u64, ApplicationTotals>::new();
-    for (process, registered_process) in snapshot.processes.iter().zip(&registered.processes) {
+    let logical_cpus = snapshot.cpu_cores.len();
+    for (application, registered_application) in applications.iter().zip(&registered.applications) {
+        for (process, process_id) in application
+            .emitted
+            .iter()
+            .zip(&registered_application.process_ids)
+        {
+            push_payload(
+                &mut payloads,
+                now,
+                *process_id,
+                ApplicationTotals::of(process)
+                    .readings(logical_cpus)
+                    .into_iter()
+                    .chain(
+                        snapshot
+                            .poet_health
+                            .iter()
+                            .flat_map(|health| health.readings_for(process.pid, now)),
+                    ),
+            );
+        }
+        if let (Some(other), Some(other_id)) = (&application.other, registered_application.other_id) {
+            push_payload(&mut payloads, now, other_id, other.totals.readings(logical_cpus));
+        }
         push_payload(
             &mut payloads,
             now,
-            registered_process.process_id,
-            [
-                MetricReading::new(PROCESS_CPU_USAGE_METRIC, process.cpu_usage_percent),
-                ih_muse_macos::cpu_capacity_percent(
-                    process.cpu_usage_percent,
-                    snapshot.cpu_cores.len(),
-                )
-                .and_then(|value| {
-                    MetricReading::new(ih_muse_macos::PROCESS_CPU_CAPACITY_METRIC, value)
-                }),
-                MetricReading::new(PROCESS_MEMORY_BYTES_METRIC, process.memory_bytes as f64),
-                MetricReading::new(
-                    PROCESS_DISK_READ_BYTES_METRIC,
-                    process.disk_read_bytes as f64,
-                ),
-                MetricReading::new(
-                    PROCESS_DISK_WRITE_BYTES_METRIC,
-                    process.disk_write_bytes as f64,
-                ),
-                process.network_received_bytes.and_then(|value| {
-                    MetricReading::new(
-                        ih_muse_macos::PROCESS_NETWORK_RECEIVED_BYTES_METRIC,
-                        value as f64,
-                    )
-                }),
-                process.network_transmitted_bytes.and_then(|value| {
-                    MetricReading::new(
-                        ih_muse_macos::PROCESS_NETWORK_TRANSMITTED_BYTES_METRIC,
-                        value as f64,
-                    )
-                }),
-            ]
-            .into_iter()
-            .chain(
-                snapshot
-                    .poet_health
-                    .iter()
-                    .flat_map(|health| health.readings_for(process.pid, now)),
-            ),
-        );
-        applications
-            .entry(registered_process.application_id)
-            .or_default()
-            .add(process);
-    }
-    for (application_id, totals) in applications {
-        push_payload(
-            &mut payloads,
-            now,
-            application_id,
-            [
-                MetricReading::new(PROCESS_CPU_USAGE_METRIC, totals.cpu_usage_percent),
-                ih_muse_macos::cpu_capacity_percent(
-                    totals.cpu_usage_percent,
-                    snapshot.cpu_cores.len(),
-                )
-                .and_then(|value| {
-                    MetricReading::new(ih_muse_macos::PROCESS_CPU_CAPACITY_METRIC, value)
-                }),
-                MetricReading::new(PROCESS_MEMORY_BYTES_METRIC, totals.memory_bytes as f64),
-                MetricReading::new(
-                    PROCESS_DISK_READ_BYTES_METRIC,
-                    totals.disk_read_bytes as f64,
-                ),
-                MetricReading::new(
-                    PROCESS_DISK_WRITE_BYTES_METRIC,
-                    totals.disk_write_bytes as f64,
-                ),
-                totals
-                    .has_network_received
-                    .then(|| {
-                        MetricReading::new(
-                            ih_muse_macos::PROCESS_NETWORK_RECEIVED_BYTES_METRIC,
-                            totals.network_received_bytes as f64,
-                        )
-                    })
-                    .flatten(),
-                totals
-                    .has_network_transmitted
-                    .then(|| {
-                        MetricReading::new(
-                            ih_muse_macos::PROCESS_NETWORK_TRANSMITTED_BYTES_METRIC,
-                            totals.network_transmitted_bytes as f64,
-                        )
-                    })
-                    .flatten(),
-            ],
+            registered_application.application_id,
+            application.totals.readings(logical_cpus),
         );
     }
 
@@ -1008,6 +1123,7 @@ fn ensure_snapshot_elements(
     registry: &mut ElementRegistry,
     static_elements: &StaticElements,
     snapshot: &CollectedSnapshot,
+    applications: &[ApplicationPlan<'_>],
 ) -> RegisteredSnapshotElements {
     let mut cpu_core_ids = Vec::with_capacity(snapshot.cpu_cores.len());
     for core in &snapshot.cpu_cores {
@@ -1084,33 +1200,53 @@ fn ensure_snapshot_elements(
         );
     }
 
-    let mut processes = Vec::with_capacity(snapshot.processes.len());
-    for process in &snapshot.processes {
-        let app_id = registry
-            .ensure(
-                process.app_key.clone(),
-                KIND_MACOS_APPLICATION,
-                process.app_name.clone(),
-                Some(static_elements.applications_group_id),
-                metadata([("resource", "process"), ("level", "application")]),
-            );
-        let process_id = registry
-            .ensure(
-                process.key.clone(),
+    let mut registered_applications = Vec::with_capacity(applications.len());
+    for application in applications {
+        let application_id = registry.ensure(
+            application.app_key.to_string(),
+            KIND_MACOS_APPLICATION,
+            application.app_name.to_string(),
+            Some(static_elements.applications_group_id),
+            metadata([("resource", "process"), ("level", "application")]),
+        );
+        let process_ids = application
+            .emitted
+            .iter()
+            .map(|process| {
+                registry.ensure(
+                    process.key.clone(),
+                    KIND_MACOS_PROCESS,
+                    format!("{} ({})", process.name, process.pid),
+                    Some(application_id),
+                    metadata([
+                        ("resource", "process"),
+                        ("level", "process"),
+                        ("pid", &process.pid.to_string()),
+                        ("parent_pid", &optional_u32(process.parent_pid)),
+                        ("start_time", &process.start_time.to_string()),
+                    ]),
+                )
+            })
+            .collect();
+        // No pid/start_time metadata: the graph identity falls back to the
+        // stable per-application key rather than a process identity.
+        let other_id = application.other.as_ref().map(|_| {
+            registry.ensure(
+                other_processes_key(application.app_key),
                 KIND_MACOS_PROCESS,
-                format!("{} ({})", process.name, process.pid),
-                Some(app_id),
+                "Other processes".to_string(),
+                Some(application_id),
                 metadata([
                     ("resource", "process"),
-                    ("level", "process"),
-                    ("pid", &process.pid.to_string()),
-                    ("parent_pid", &optional_u32(process.parent_pid)),
-                    ("start_time", &process.start_time.to_string()),
+                    ("level", "process_group"),
+                    ("process_group", "other"),
                 ]),
-            );
-        processes.push(RegisteredProcess {
-            application_id: app_id,
-            process_id,
+            )
+        });
+        registered_applications.push(RegisteredApplication {
+            application_id,
+            process_ids,
+            other_id,
         });
     }
 
@@ -1120,7 +1256,7 @@ fn ensure_snapshot_elements(
         network_interface_ids,
         battery_id,
         thermal_sensor_ids,
-        processes,
+        applications: registered_applications,
     }
 }
 
@@ -1191,20 +1327,40 @@ fn collect_thermal_sensors(components: &Components) -> Vec<ThermalSensorSample> 
         .collect()
 }
 
+/// Samples every process; each is attributed to its application through
+/// [`resolve_application`] over the full process table.
 fn collect_processes(
     system: &System,
-    top_processes: usize,
     process_network: &HashMap<String, ProcessNetworkSample>,
 ) -> Vec<ProcessSample> {
-    let mut processes = system
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let table = system
         .processes()
         .iter()
         .map(|(pid, process)| {
             let name = os_str_to_display(process.name())
                 .filter(|name| !name.trim().is_empty())
                 .unwrap_or_else(|| format!("process-{}", pid.as_u32()));
-            let app_name = application_name(&name, process.exe());
-            let app_key = format!("app:{app_name}");
+            (
+                pid.as_u32(),
+                ProcessIdentity::new(
+                    name,
+                    process.parent().map(|parent| parent.as_u32()),
+                    process.exe(),
+                    home.as_deref(),
+                ),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    system
+        .processes()
+        .iter()
+        .map(|(pid, process)| {
+            let name = table[&pid.as_u32()].name.clone();
+            let ApplicationRef {
+                key: app_key,
+                name: app_name,
+            } = resolve_application(pid.as_u32(), &table);
             let disk_usage = process.disk_usage();
             let network = process_network.get(&name).copied();
             ProcessSample {
@@ -1223,34 +1379,7 @@ fn collect_processes(
                 network_transmitted_bytes: network.map(|sample| sample.transmitted_bytes),
             }
         })
-        .collect::<Vec<_>>();
-
-    processes.sort_by(|left, right| {
-        process_score(right)
-            .partial_cmp(&process_score(left))
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| left.name.cmp(&right.name))
-            .then_with(|| left.pid.cmp(&right.pid))
-    });
-    let mut rank = 0;
-    processes.retain(|process| {
-        let keep = retain_process(rank, top_processes, &process.name);
-        rank += 1;
-        keep
-    });
-    processes
-}
-
-fn retain_process(rank: usize, top_processes: usize, name: &str) -> bool {
-    rank < top_processes.max(1) || matches!(name, "poet" | "ih-muse-macos")
-}
-
-#[test]
-fn self_observation_is_independent_of_process_ranking() {
-    assert!(retain_process(100, 12, "poet"));
-    assert!(retain_process(100, 12, "ih-muse-macos"));
-    assert!(!retain_process(100, 12, "other"));
-    assert!(retain_process(0, 12, "other"));
+        .collect()
 }
 
 fn read_nettop_process_network() -> Result<HashMap<String, ProcessNetworkSample>> {
@@ -1349,18 +1478,105 @@ fn read_battery_snapshot() -> Option<BatterySnapshot> {
     parse_pmset_battery(&String::from_utf8_lossy(&output.stdout))
 }
 
-fn application_name(process_name: &str, executable: Option<&Path>) -> String {
-    executable
-        .and_then(|path| {
-            path.ancestors().find_map(|ancestor| {
-                let file_name = ancestor.file_name()?.to_string_lossy();
-                file_name
-                    .strip_suffix(".app")
-                    .map(|name| name.to_string())
-                    .filter(|name| !name.is_empty())
-            })
-        })
-        .unwrap_or_else(|| process_name.to_string())
+/// Name, parent, own `.app` bundle and developer-tool location of one
+/// process, for attribution.
+struct ProcessIdentity {
+    name: String,
+    parent_pid: Option<u32>,
+    bundle: Option<String>,
+    /// Executable lives under the user's home, `/opt/homebrew` or `/usr/local`.
+    developer_tool: bool,
+}
+
+impl ProcessIdentity {
+    fn new(name: String, parent_pid: Option<u32>, executable: Option<&Path>, home: Option<&Path>) -> Self {
+        Self {
+            name,
+            parent_pid,
+            bundle: executable.and_then(outermost_app_bundle),
+            developer_tool: executable.is_some_and(|path| is_developer_tool_path(path, home)),
+        }
+    }
+}
+
+/// The application a process is attributed to: stable graph key and name.
+#[derive(Debug, PartialEq, Eq)]
+struct ApplicationRef {
+    key: String,
+    name: String,
+}
+
+impl ApplicationRef {
+    fn named(name: &str) -> Self {
+        Self {
+            key: format!("app:{name}"),
+            name: name.to_string(),
+        }
+    }
+
+    /// The single application for bundle-less system daemons.
+    fn system_services() -> Self {
+        Self {
+            key: "app:system-services".to_string(),
+            name: "System services".to_string(),
+        }
+    }
+}
+
+/// Whether a bundle-less executable is a developer tool that keeps its own
+/// application (grouped by process name) instead of joining System services.
+fn is_developer_tool_path(executable: &Path, home: Option<&Path>) -> bool {
+    home.is_some_and(|home| home.components().count() > 1 && executable.starts_with(home))
+        || executable.starts_with("/opt/homebrew")
+        || executable.starts_with("/usr/local")
+}
+
+/// The OUTERMOST `.app` bundle containing `executable`, so helper bundles
+/// nested inside an application (`Code Helper (Renderer).app` inside
+/// `Visual Studio Code.app`) belong to that application.
+fn outermost_app_bundle(executable: &Path) -> Option<String> {
+    executable.components().find_map(|component| {
+        let name = component.as_os_str().to_string_lossy();
+        name.strip_suffix(".app")
+            .filter(|name| !name.is_empty())
+            .map(str::to_string)
+    })
+}
+
+/// Maximum parent hops when attributing a bundle-less process.
+const MAX_ANCESTOR_HOPS: usize = 64;
+
+/// Application of `pid`: its own outermost bundle, else the nearest
+/// ancestor's bundle (never through launchd/pid 1 or kernel_task), else its
+/// process name for developer tools, else the shared System services.
+fn resolve_application(pid: u32, table: &HashMap<u32, ProcessIdentity>) -> ApplicationRef {
+    let Some(process) = table.get(&pid) else {
+        return ApplicationRef::system_services();
+    };
+    if let Some(bundle) = &process.bundle {
+        return ApplicationRef::named(bundle);
+    }
+    let mut next = process.parent_pid;
+    for _ in 0..MAX_ANCESTOR_HOPS {
+        let Some(parent_pid) = next.filter(|parent| *parent > 1 && *parent != pid) else {
+            break;
+        };
+        let Some(parent) = table.get(&parent_pid) else {
+            break;
+        };
+        if matches!(parent.name.as_str(), "launchd" | "kernel_task") {
+            break;
+        }
+        if let Some(bundle) = &parent.bundle {
+            return ApplicationRef::named(bundle);
+        }
+        next = parent.parent_pid;
+    }
+    if process.developer_tool {
+        ApplicationRef::named(&process.name)
+    } else {
+        ApplicationRef::system_services()
+    }
 }
 
 fn os_str_to_display(value: &std::ffi::OsStr) -> Option<String> {
@@ -1410,18 +1626,310 @@ fn hostname() -> String {
 mod tests {
     use super::*;
 
+    const HOME: &str = "/Users/dev";
+
+    fn identity(name: &str, parent_pid: Option<u32>, exe: Option<&str>) -> ProcessIdentity {
+        ProcessIdentity::new(
+            name.to_string(),
+            parent_pid,
+            exe.map(Path::new),
+            Some(Path::new(HOME)),
+        )
+    }
+
+    fn app(pid: u32, table: &HashMap<u32, ProcessIdentity>) -> String {
+        resolve_application(pid, table).name
+    }
+
+    /// Samples every process of `table` as `collect_processes` would.
+    fn samples_from(table: &HashMap<u32, ProcessIdentity>) -> Vec<ProcessSample> {
+        table
+            .iter()
+            .map(|(pid, identity)| {
+                let application = resolve_application(*pid, table);
+                ProcessSample {
+                    key: format!("process:{pid}:1"),
+                    app_key: application.key,
+                    app_name: application.name,
+                    name: identity.name.clone(),
+                    pid: *pid,
+                    parent_pid: identity.parent_pid,
+                    start_time: 1,
+                    cpu_usage_percent: (*pid % 7) as f32,
+                    memory_bytes: u64::from(*pid) * 1_048_576,
+                    disk_read_bytes: 0,
+                    disk_write_bytes: 0,
+                    network_received_bytes: None,
+                    network_transmitted_bytes: None,
+                }
+            })
+            .collect()
+    }
+
+    fn base_table() -> HashMap<u32, ProcessIdentity> {
+        HashMap::from([
+            (0, identity("kernel_task", None, None)),
+            (1, identity("launchd", Some(0), Some("/sbin/launchd"))),
+        ])
+    }
+
+    fn sample(pid: u32, app: &str, cpu: f32, memory_bytes: u64) -> ProcessSample {
+        ProcessSample {
+            key: format!("process:{pid}:1"),
+            app_key: format!("app:{app}"),
+            app_name: app.to_string(),
+            name: format!("proc-{pid}"),
+            pid,
+            parent_pid: Some(1),
+            start_time: 1,
+            cpu_usage_percent: cpu,
+            memory_bytes,
+            disk_read_bytes: u64::from(pid),
+            disk_write_bytes: 2 * u64::from(pid),
+            network_received_bytes: pid.is_multiple_of(2).then_some(10),
+            network_transmitted_bytes: None,
+        }
+    }
+
+    fn keys(pids: &[u32]) -> HashSet<String> {
+        pids.iter().map(|pid| format!("process:{pid}:1")).collect()
+    }
+
     #[test]
-    fn application_name_prefers_app_bundle_without_exposing_full_path() {
-        assert_eq!(
-            application_name(
-                "Google Chrome Helper",
-                Some(Path::new(
-                    "/Applications/Google Chrome.app/Contents/Frameworks/helper"
-                ))
+    fn outermost_bundle_groups_nested_helpers_under_their_application() {
+        let cases = [
+            (
+                "/Applications/Visual Studio Code.app/Contents/Frameworks/Code Helper (Renderer).app/Contents/MacOS/Code Helper (Renderer)",
+                "Visual Studio Code",
             ),
-            "Google Chrome"
+            (
+                "/Applications/Brave Browser.app/Contents/Frameworks/Brave Browser Framework.framework/Versions/1.2.3/Helpers/Brave Browser Helper (GPU).app/Contents/MacOS/Brave Browser Helper (GPU)",
+                "Brave Browser",
+            ),
+            (
+                "/Applications/Google Chrome.app/Contents/Frameworks/Google Chrome Framework.framework/Versions/1/Helpers/Google Chrome Helper (Renderer).app/Contents/MacOS/Google Chrome Helper (Renderer)",
+                "Google Chrome",
+            ),
+            ("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome", "Google Chrome"),
+        ];
+        for (path, expected) in cases {
+            assert_eq!(outermost_app_bundle(Path::new(path)).as_deref(), Some(expected), "{path}");
+        }
+        assert_eq!(outermost_app_bundle(Path::new("/usr/bin/zsh")), None);
+        assert_eq!(outermost_app_bundle(Path::new("/tmp/.app/x")), None);
+    }
+
+    #[test]
+    fn bundle_less_processes_inherit_the_nearest_bundled_ancestor() {
+        let table = HashMap::from([
+            (0, identity("kernel_task", None, None)),
+            (1, identity("launchd", Some(0), None)),
+            (
+                100,
+                identity(
+                    "Code",
+                    Some(1),
+                    Some("/Applications/Visual Studio Code.app/Contents/MacOS/Code"),
+                ),
+            ),
+            (200, identity("zsh", Some(100), Some("/bin/zsh"))),
+            (300, identity("cargo", Some(200), None)),
+            (400, identity("mds", Some(1), Some("/System/Library/mds"))),
+            (500, identity("orphan", Some(9999), None)),
+            (600, identity("child-of-kernel", Some(0), None)),
+        ]);
+        assert_eq!(app(300, &table), "Visual Studio Code");
+        assert_eq!(app(200, &table), "Visual Studio Code");
+        assert_eq!(app(100, &table), "Visual Studio Code");
+        // Bundle-less processes with no bundled ancestor share System services.
+        for pid in [400, 1, 0, 500, 600] {
+            assert_eq!(resolve_application(pid, &table), ApplicationRef::system_services(), "{pid}");
+        }
+    }
+
+    #[test]
+    fn bundle_less_developer_tools_keep_their_own_application() {
+        let mut table = base_table();
+        table.insert(10, identity("cargo", Some(1), Some("/Users/dev/.cargo/bin/cargo")));
+        table.insert(11, identity("python3", Some(1), Some("/opt/homebrew/bin/python3")));
+        table.insert(12, identity("node", Some(1), Some("/usr/local/bin/node")));
+        table.insert(13, identity("poet", Some(1), Some("/Users/dev/git/ih/target/release/poet")));
+        table.insert(14, identity("syslogd", Some(1), Some("/usr/sbin/syslogd")));
+        table.insert(15, identity("hidden", Some(1), None));
+        assert_eq!(resolve_application(10, &table), ApplicationRef::named("cargo"));
+        assert_eq!(app(11, &table), "python3");
+        assert_eq!(app(12, &table), "node");
+        assert_eq!(resolve_application(13, &table).key, "app:poet");
+        assert_eq!(resolve_application(14, &table).key, "app:system-services");
+        assert_eq!(resolve_application(15, &table).key, "app:system-services");
+        // A root home never makes every path a developer tool.
+        assert!(!is_developer_tool_path(Path::new("/usr/sbin/syslogd"), Some(Path::new("/"))));
+    }
+
+    #[test]
+    fn launchd_daemons_collapse_into_one_system_services_application() {
+        let mut table = base_table();
+        for pid in 100..400 {
+            table.insert(pid, identity(&format!("daemon{pid}"), Some(1), Some("/usr/libexec/daemon")));
+        }
+        table.insert(500, identity("cargo", Some(1), Some("/Users/dev/.cargo/bin/cargo")));
+        table.insert(501, identity("node", Some(1), Some("/opt/homebrew/bin/node")));
+        let processes = samples_from(&table);
+        let emitted = ProcessSelector::new(12, 30).select(&processes);
+        let plans = plan_applications(&processes, &emitted);
+        let keys = plans.iter().map(|plan| plan.app_key).collect::<Vec<_>>();
+        assert_eq!(keys, ["app:cargo", "app:node", "app:system-services"]);
+        let system = &plans[2];
+        assert_eq!(system.app_name, "System services");
+        assert_eq!(system.emitted.len() + system.other.as_ref().map_or(0, |o| o.count), 302);
+    }
+
+    #[test]
+    fn realistic_process_table_bounds_application_payloads() {
+        let mut table = base_table();
+        let mut pid = 100;
+        for index in 0..40 {
+            let main = pid;
+            let bundle = format!("/Applications/App{index}.app");
+            table.insert(main, identity(&format!("App{index}"), Some(1), Some(&format!("{bundle}/Contents/MacOS/App{index}"))));
+            for helper in 0..2 {
+                pid += 1;
+                let exe = format!("{bundle}/Contents/Frameworks/Helper {helper}.app/Contents/MacOS/Helper {helper}");
+                table.insert(pid, identity(&format!("Helper {helper}"), Some(main), Some(&exe)));
+            }
+            pid += 1;
+        }
+        for _ in 0..458 {
+            table.insert(pid, identity(&format!("daemon{pid}"), Some(1), Some("/usr/libexec/daemon")));
+            pid += 1;
+        }
+        for index in 0..20 {
+            let exe = format!("/opt/homebrew/bin/tool{index}");
+            table.insert(pid, identity(&format!("tool{index}"), Some(1), Some(&exe)));
+            pid += 1;
+        }
+        assert_eq!(table.len(), 600);
+        let processes = samples_from(&table);
+        let emitted = ProcessSelector::new(DEFAULT_TOP_PROCESSES, DEFAULT_PROCESS_HOLD_SAMPLES).select(&processes);
+        let plans = plan_applications(&processes, &emitted);
+        let applications = plans.len();
+        let process_payloads = plans.iter().map(|plan| plan.emitted.len()).sum::<usize>();
+        let other_payloads = plans.iter().filter(|plan| plan.other.is_some()).count();
+        println!(
+            "600 processes: {applications} application payloads, {process_payloads} process payloads, {other_payloads} other-processes payloads, {} total",
+            applications + process_payloads + other_payloads
         );
-        assert_eq!(application_name("launchd", None), "launchd");
+        assert_eq!(applications, 40 + 20 + 1);
+        assert_eq!(process_payloads, DEFAULT_TOP_PROCESSES);
+        assert!(other_payloads <= applications);
+    }
+
+    #[test]
+    fn ancestor_walk_terminates_on_parent_cycles() {
+        let table = HashMap::from([
+            (10, identity("a", Some(11), None)),
+            (11, identity("b", Some(10), None)),
+        ]);
+        assert_eq!(resolve_application(10, &table), ApplicationRef::system_services());
+    }
+
+    #[test]
+    fn application_totals_cover_every_process_and_children_sum_to_them() {
+        let processes = vec![
+            sample(2, "Brave", 40.0, 100),
+            sample(3, "Brave", 5.0, 50),
+            sample(4, "Brave", 1.0, 25),
+            sample(5, "mds", 2.0, 7),
+        ];
+        let plans = plan_applications(&processes, &keys(&[2]));
+        assert_eq!(plans.len(), 2, "every application with a process appears");
+
+        let brave = &plans[0];
+        assert_eq!(brave.app_key, "app:Brave");
+        assert_eq!(brave.totals.cpu_usage_percent, 46.0);
+        assert_eq!(brave.totals.memory_bytes, 175);
+        assert_eq!(brave.emitted.iter().map(|p| p.pid).collect::<Vec<_>>(), [2]);
+        let other = brave.other.as_ref().expect("un-emitted Brave processes");
+        assert_eq!(other.count, 2);
+        let mut children = ApplicationTotals::of(brave.emitted[0]);
+        children.cpu_usage_percent += other.totals.cpu_usage_percent;
+        children.memory_bytes += other.totals.memory_bytes;
+        children.disk_read_bytes += other.totals.disk_read_bytes;
+        children.disk_write_bytes += other.totals.disk_write_bytes;
+        children.network_received_bytes += other.totals.network_received_bytes;
+        assert_eq!(children.cpu_usage_percent, brave.totals.cpu_usage_percent);
+        assert_eq!(children.memory_bytes, brave.totals.memory_bytes);
+        assert_eq!(children.disk_read_bytes, brave.totals.disk_read_bytes);
+        assert_eq!(children.disk_write_bytes, brave.totals.disk_write_bytes);
+        assert_eq!(children.network_received_bytes, brave.totals.network_received_bytes);
+        // pid 4 had network, pid 3 did not: the remainder reports it, while
+        // transmitted stays absent (missing, not a measured zero).
+        assert!(other.totals.has_network_received);
+        assert!(!other.totals.has_network_transmitted);
+        assert!(other.totals.readings(8)[6].is_none());
+
+        let mds = &plans[1];
+        assert!(mds.emitted.is_empty());
+        assert_eq!(mds.other.as_ref().map(|other| other.count), Some(1));
+        assert_eq!(other_processes_key(mds.app_key), "app:mds:other");
+    }
+
+    #[test]
+    fn fully_emitted_application_has_no_other_child() {
+        let processes = vec![sample(2, "Brave", 1.0, 1), sample(3, "Brave", 1.0, 1)];
+        let plans = plan_applications(&processes, &keys(&[2, 3]));
+        assert!(plans[0].other.is_none());
+        assert_eq!(plans[0].emitted.len(), 2);
+    }
+
+    #[test]
+    fn selector_holds_processes_that_leave_the_top_while_they_exist() {
+        let mut selector = ProcessSelector::new(1, 2);
+        let mut processes = vec![sample(2, "a", 50.0, 0), sample(3, "b", 10.0, 0)];
+        assert_eq!(selector.select(&processes), keys(&[2]));
+        // pid 3 overtakes pid 2, which is held for two more samples.
+        processes[1].cpu_usage_percent = 90.0;
+        assert_eq!(selector.select(&processes), keys(&[2, 3]));
+        assert_eq!(selector.select(&processes), keys(&[2, 3]));
+        assert_eq!(selector.select(&processes), keys(&[3]));
+        // pid 2 retakes the top; pid 3 is now the held one.
+        processes[0].cpu_usage_percent = 99.0;
+        assert_eq!(selector.select(&processes), keys(&[2, 3]));
+        // A held process that exits loses its hold and is not resurrected.
+        let only_two = vec![processes[0].clone()];
+        assert_eq!(selector.select(&only_two), keys(&[2]));
+        assert_eq!(selector.select(&processes), keys(&[2]));
+    }
+
+    #[test]
+    fn selector_bounds_held_processes_to_twice_the_top() {
+        let mut selector = ProcessSelector::new(2, 30);
+        let mut processes = (2..=9)
+            .map(|pid| sample(pid, "a", pid as f32, 0))
+            .collect::<Vec<_>>();
+        // Rotate the leaders so every process is ranked top at some point.
+        for round in 0..4 {
+            for process in &mut processes {
+                process.cpu_usage_percent = if (process.pid as usize - 2) / 2 == round {
+                    100.0
+                } else {
+                    process.pid as f32
+                };
+            }
+            let emitted = selector.select(&processes);
+            assert!(emitted.len() <= 4, "round {round}: {emitted:?}");
+        }
+    }
+
+    #[test]
+    fn selector_always_emits_self_observed_processes() {
+        let mut selector = ProcessSelector::new(1, 0);
+        let mut poet = sample(7, "poet", 0.0, 0);
+        poet.name = "poet".into();
+        let mut muse = sample(8, "muse", 0.0, 0);
+        muse.name = "ih-muse-macos".into();
+        let processes = vec![sample(2, "a", 50.0, 0), sample(3, "b", 40.0, 0), poet, muse];
+        assert_eq!(selector.select(&processes), keys(&[2, 7, 8]));
     }
 
     #[test]

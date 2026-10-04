@@ -341,7 +341,13 @@ struct Sampler {
     components: Components,
     previous_battery: Option<(i64, BatterySnapshot)>,
     process_network_available: bool,
+    /// Samples since the volumes were last listed.
+    samples_since_volume_list: u32,
 }
+
+/// Samples between two listings of the mounted volumes when no disk event
+/// asked for one (a new volume becomes an element at the latest then).
+const VOLUME_LIST_EVERY_SAMPLES: u32 = 30;
 
 impl Sampler {
     fn new(process_selector: ProcessSelector) -> Self {
@@ -365,6 +371,7 @@ impl Sampler {
             components,
             previous_battery: None,
             process_network_available: true,
+            samples_since_volume_list: 0,
         }
     }
 
@@ -376,7 +383,18 @@ impl Sampler {
         self.system.refresh_cpu_all();
         self.system.refresh_memory();
         self.system.refresh_processes(ProcessesToUpdate::All, true);
-        self.disks.refresh();
+        // A mount or unmount in the unified log (or the periodic listing)
+        // lists the volumes again, so a new volume becomes an element and
+        // its mount line can name it.
+        self.samples_since_volume_list += 1;
+        if ih_muse_macos::logs::take_volumes_changed()
+            || self.samples_since_volume_list >= VOLUME_LIST_EVERY_SAMPLES
+        {
+            self.disks.refresh_list();
+            self.samples_since_volume_list = 0;
+        } else {
+            self.disks.refresh();
+        }
         self.networks.refresh();
         self.components.refresh();
 

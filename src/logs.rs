@@ -14,11 +14,17 @@
 //! Poet's element mapping resolves to the Mac host element. A crash record
 //! also carries `process.pid` and `process.executable.name` of the crashed
 //! process, so Poet maps it to that process element while the Muse still
-//! reports it. Volume, interface, battery and sensor elements are named in
-//! `macos.element.key` (the Muse's element key) for readers; Poet maps such
-//! records to the host.
+//! reports it. The element an event concerns (a volume, an interface, the
+//! battery, a resource group) is named in [`ELEMENT_KEY_ATTRIBUTE`]
+//! (`ih.element.key`, this Muse's element key); Poet looks it up among this
+//! Muse's elements on the same Mac and attaches the record to it, else to
+//! the host. Disk events name the device (`/dev/disk4s1`); the Muse
+//! translates it to the volume's mount point (`disk:/Volumes/Data`, the
+//! volume element's key) from the mounted file systems, remembering each
+//! device's mount point so an unmount line still names the volume.
 
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::io::{BufRead, BufReader};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -40,6 +46,113 @@ pub const MAX_BATCH_BYTES: usize = 512 * 1024;
 /// one noisy source cannot starve the others.
 const CATEGORY_BURST: f64 = 50.0;
 const CATEGORY_RATE_PER_SECOND: f64 = 5.0;
+
+/// The record attribute naming the Muse element a record concerns, by this
+/// Muse's element key (Poet's generic attribute for any Muse).
+pub const ELEMENT_KEY_ATTRIBUTE: &str = "ih.element.key";
+
+/// Set when a disk was mounted, unmounted or ejected: the sampler then
+/// lists the volumes again so a new volume becomes an element.
+static VOLUMES_CHANGED: AtomicBool = AtomicBool::new(false);
+
+/// Whether a disk event was seen since the last call (and clears it).
+pub fn take_volumes_changed() -> bool {
+    VOLUMES_CHANGED.swap(false, Ordering::Relaxed)
+}
+
+/// Lists the mounted file systems as `(device, mount point)` pairs.
+pub type VolumeReader = fn() -> Vec<(String, String)>;
+
+/// The mounted file systems (`getfsstat`): device (`/dev/disk4s1`) and
+/// mount point.
+#[cfg(target_os = "macos")]
+pub fn mounted_volumes() -> Vec<(String, String)> {
+    fn text(chars: &[libc::c_char]) -> String {
+        let bytes: Vec<u8> = chars.iter().take_while(|c| **c != 0).map(|c| *c as u8).collect();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+    // SAFETY: getfsstat writes at most `size` bytes of statfs records into
+    // the buffer and returns how many it wrote.
+    unsafe {
+        let count = libc::getfsstat(std::ptr::null_mut(), 0, libc::MNT_NOWAIT);
+        if count < 1 {
+            return Vec::new();
+        }
+        let capacity = count as usize + 8;
+        let mut records: Vec<libc::statfs> = Vec::with_capacity(capacity);
+        let size = (capacity * std::mem::size_of::<libc::statfs>()) as libc::c_int;
+        let written = libc::getfsstat(records.as_mut_ptr(), size, libc::MNT_NOWAIT);
+        if written < 1 {
+            return Vec::new();
+        }
+        records.set_len((written as usize).min(capacity));
+        records.iter().map(|record| (text(&record.f_mntfromname), text(&record.f_mntonname))).collect()
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn mounted_volumes() -> Vec<(String, String)> {
+    Vec::new()
+}
+
+/// Device to mount point of the volumes seen mounted, so a disk event names
+/// the volume element (`disk:<mount point>`, the key the sampler gives it).
+#[derive(Debug)]
+pub struct VolumeMap {
+    reader: VolumeReader,
+    by_device: HashMap<String, String>,
+}
+
+impl VolumeMap {
+    pub fn new(reader: VolumeReader) -> Self {
+        Self { reader, by_device: HashMap::new() }
+    }
+
+    /// Reads the mounted file systems again (devices stay remembered until
+    /// their unmount is handled).
+    pub fn refresh(&mut self) {
+        for (device, mount) in (self.reader)() {
+            if device.starts_with("/dev/") && !mount.is_empty() {
+                self.by_device.insert(device, mount);
+            }
+        }
+    }
+
+    fn find(&self, device: &str) -> Option<String> {
+        if let Some(mount) = self.by_device.get(device) {
+            return Some(mount.clone());
+        }
+        // A whole disk (`/dev/disk4`, an eject): its only volume.
+        let prefix = format!("{device}s");
+        let mut volumes = self.by_device.iter().filter(|(known, _)| known.starts_with(&prefix));
+        match (volumes.next(), volumes.next()) {
+            (Some((_, mount)), None) => Some(mount.clone()),
+            _ => None,
+        }
+    }
+
+    /// The volume element key of `device` for `event_name`: a mount reads
+    /// the mounted file systems now; an unmount or eject uses what was
+    /// remembered (the volume is gone already) and then forgets it.
+    pub fn element_key(&mut self, event_name: &str, device: &str) -> Option<String> {
+        let mount = match event_name {
+            "macos.disk.mounted" => {
+                self.refresh();
+                self.find(device)
+            }
+            _ => {
+                let found = self.find(device).or_else(|| {
+                    self.refresh();
+                    self.find(device)
+                });
+                let prefix = format!("{device}s");
+                self.by_device.retain(|known, _| known != device && !known.starts_with(&prefix));
+                found
+            }
+        };
+        mount.map(|mount| format!("disk:{mount}"))
+    }
+}
 
 /// Prefix a test line must start with to be collected (test hook only).
 pub const TEST_LINE_PREFIX: &str = "ih-muse-test";
@@ -219,7 +332,8 @@ pub fn classify(entry: &UnifiedLogEntry, test_hook: bool) -> Option<Classified> 
     let message = entry.event_message.as_str();
     match entry.process() {
         "logger" if test_hook && message.starts_with(TEST_LINE_PREFIX) => {
-            Some(Classified::new("macos.test.line", Category::Test).element("host"))
+            // The resource's host already names the element.
+            Some(Classified::new("macos.test.line", Category::Test))
         }
         "ReportCrash" => {
             // "Formulating fatal 309 report for corpse[62576] ihmusecrash"
@@ -556,6 +670,7 @@ pub struct LogBuffer {
     categories: HashMap<Category, TokenBucket>,
     queue: VecDeque<OutRecord>,
     stats: LogStats,
+    volumes: VolumeMap,
 }
 
 impl LogBuffer {
@@ -567,7 +682,20 @@ impl LogBuffer {
             categories: HashMap::new(),
             queue: VecDeque::new(),
             stats: LogStats::default(),
+            volumes: VolumeMap::new(mounted_volumes),
         }
+    }
+
+    /// Reads mounted file systems with `reader` instead (tests).
+    pub fn with_volume_reader(mut self, reader: VolumeReader) -> Self {
+        self.volumes = VolumeMap::new(reader);
+        self
+    }
+
+    /// Remembers the volumes mounted now (so an unmount of a volume mounted
+    /// before this Muse started still names it).
+    pub fn refresh_volumes(&mut self) {
+        self.volumes.refresh();
     }
 
     pub fn stats(&self) -> LogStats {
@@ -591,10 +719,20 @@ impl LogBuffer {
             return false;
         };
         self.stats.lines_read += 1;
-        let Some(classified) = classify(&entry, self.settings.test_hook) else {
+        let Some(mut classified) = classify(&entry, self.settings.test_hook) else {
             self.stats.filtered += 1;
             return false;
         };
+        if classified.category == Category::Disk {
+            VOLUMES_CHANGED.store(true, Ordering::Relaxed);
+            let device = classified.attributes.iter().find_map(|(key, value)| match value {
+                AttrValue::Str(device) if key == "macos.disk.device" => Some(device.clone()),
+                _ => None,
+            });
+            if let Some(key) = device.and_then(|device| self.volumes.element_key(classified.event_name, &device)) {
+                classified.element_key = Some(key);
+            }
+        }
         let bucket = self
             .categories
             .entry(classified.category)
@@ -638,7 +776,7 @@ impl LogBuffer {
             attributes.push(("macos.log.category".into(), AttrValue::Str(entry.category.clone())));
         }
         if let Some(key) = classified.element_key {
-            attributes.push(("macos.element.key".into(), AttrValue::Str(key)));
+            attributes.push((ELEMENT_KEY_ATTRIBUTE.into(), AttrValue::Str(key)));
         }
         if let Some((pid, name)) = classified.process {
             attributes.push(("process.pid".into(), AttrValue::Int(pid)));
@@ -817,6 +955,7 @@ pub fn spawn_collector(buffer: Arc<Mutex<LogBuffer>>, test_hook: bool) {
         .spawn(move || loop {
             match start_stream(&predicate) {
                 Ok(mut child) => {
+                    buffer.lock().unwrap_or_else(std::sync::PoisonError::into_inner).refresh_volumes();
                     if let Some(stdout) = child.stdout.take() {
                         let mut reader = BufReader::new(stdout);
                         let mut line = String::new();
@@ -952,6 +1091,88 @@ mod tests {
 
     fn buffer(test_hook: bool) -> LogBuffer {
         LogBuffer::new(LogSettings { test_hook, ..LogSettings::default() }, Some("/Users/alice".into()), Instant::now())
+            .with_volume_reader(fake_volumes)
+    }
+
+    thread_local! {
+        /// What [`fake_volumes`] answers on this test's thread.
+        static MOUNTED: std::cell::RefCell<Vec<(String, String)>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    fn fake_volumes() -> Vec<(String, String)> {
+        MOUNTED.with(|mounted| mounted.borrow().clone())
+    }
+
+    fn mount(volumes: &[(&str, &str)]) {
+        MOUNTED.with(|mounted| {
+            *mounted.borrow_mut() = volumes.iter().map(|(device, mount)| (device.to_string(), mount.to_string())).collect();
+        });
+    }
+
+    fn diskarbitration(message: &str) -> String {
+        format!(
+            r#"{{"timestamp":"2026-10-04 10:00:00.000000+0200","messageType":"Default","eventMessage":"{message}","processImagePath":"/usr/libexec/diskarbitrationd","processID":120}}"#
+        )
+    }
+
+    fn element_key(record: &OutRecord) -> Option<&str> {
+        record.attributes.iter().find_map(|(key, value)| match value {
+            AttrValue::Str(text) if key == ELEMENT_KEY_ATTRIBUTE => Some(text.as_str()),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn disk_events_name_the_volume_element_by_mount_point() {
+        let mut buffer = buffer(false);
+        // Mounted before the Muse started, remembered at stream start.
+        mount(&[("/dev/disk3s1", "/System/Volumes/Data"), ("/dev/disk5s2", "/Volumes/Backup")]);
+        buffer.refresh_volumes();
+        // A disk image mounted now: read at its mount line.
+        mount(&[("/dev/disk3s1", "/System/Volumes/Data"), ("/dev/disk5s2", "/Volumes/Backup"), ("/dev/disk4s1", "/Volumes/Image One")]);
+        let _ = take_volumes_changed();
+        assert!(buffer.ingest_line(&diskarbitration("mounted disk, id = /dev/disk4s1, success."), Instant::now(), 1));
+        assert!(take_volumes_changed(), "the sampler lists the volumes again");
+        // Both volumes are gone by their unmount / eject lines.
+        mount(&[("/dev/disk3s1", "/System/Volumes/Data")]);
+        assert!(buffer.ingest_line(&diskarbitration("unmounted disk, id = /dev/disk4s1, success."), Instant::now(), 2));
+        assert!(buffer.ingest_line(&diskarbitration("ejected disk, id = /dev/disk5, success."), Instant::now(), 3));
+        // Never seen mounted: the storage group.
+        assert!(buffer.ingest_line(&diskarbitration("unmounted disk, id = /dev/disk9s1, success."), Instant::now(), 4));
+        // Forgotten after its unmount: a second unmount line names the group.
+        assert!(buffer.ingest_line(&diskarbitration("unmounted disk, id = /dev/disk4s1, success."), Instant::now(), 5));
+        let records = buffer.peek_batch();
+        let keys: Vec<_> = records.iter().map(element_key).collect();
+        assert_eq!(
+            keys,
+            [
+                Some("disk:/Volumes/Image One"),
+                Some("disk:/Volumes/Image One"),
+                Some("disk:/Volumes/Backup"),
+                Some("group:storage"),
+                Some("group:storage"),
+            ]
+        );
+        assert!(records.iter().all(|record| record.attributes.iter().all(|(key, _)| key != "macos.element.key")));
+    }
+
+    #[test]
+    fn other_events_name_their_element_with_the_generic_attribute() {
+        let mut buffer = buffer(true);
+        let line = r#"{"timestamp":"2026-10-04 10:00:00.000000+0200","messageType":"Default","eventMessage":"en0 link INACTIVE","processImagePath":"/usr/libexec/configd","processID":99}"#;
+        assert!(buffer.ingest_line(line, Instant::now(), 1));
+        assert!(buffer.ingest_line(LOGGER, Instant::now(), 2));
+        let records = buffer.peek_batch();
+        assert_eq!(element_key(&records[0]), Some("network:en0"));
+        assert_eq!(element_key(&records[1]), None, "the host is named by the resource");
+    }
+
+    #[test]
+    fn the_mounted_file_systems_include_the_root_volume() {
+        let volumes = mounted_volumes();
+        if cfg!(target_os = "macos") {
+            assert!(volumes.iter().any(|(device, mount)| device.starts_with("/dev/") && mount == "/"), "{volumes:?}");
+        }
     }
 
     #[test]

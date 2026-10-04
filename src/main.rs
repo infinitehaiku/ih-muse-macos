@@ -1,39 +1,54 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
+use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use ih_muse_client::PoetClient;
-use ih_muse_core::Transport;
-use ih_muse_proto::{ElementRegistration, MetricPayload};
+use ih_muse_client::GraphPoetClient;
+use ih_muse_macos::graph::GraphRegistry;
+use ih_muse_proto::{GraphIntakeRequest, MetricPayload};
 use sysinfo::{Components, Disks, Networks, ProcessesToUpdate, System};
 
 use ih_muse_macos::{
-    element_kind_definitions, metric_definitions, metric_payload, parse_pmset_battery,
-    snapshot_from_values, BatterySnapshot, MetricReading, BATTERY_CHARGE_METRIC,
+    metric_definitions, metric_payload, parse_pmset_battery,
+    snapshot_from_values, BatterySnapshot, MetricReading, PendingSamples, BATTERY_CHARGE_METRIC,
     BATTERY_CHARGING_METRIC, BATTERY_DRAIN_RATE_METRIC, BATTERY_ON_BATTERY_METRIC,
     CPU_CORE_USAGE_METRIC, DISK_AVAILABLE_BYTES_METRIC, DISK_USAGE_METRIC, DISK_USED_BYTES_METRIC,
     KIND_MACOS_APPLICATION, KIND_MACOS_CPU_CORE, KIND_MACOS_DISK_VOLUME, KIND_MACOS_HOST,
     KIND_MACOS_NETWORK_INTERFACE, KIND_MACOS_POWER_SOURCE, KIND_MACOS_PROCESS, KIND_MACOS_RESOURCE,
     KIND_MACOS_RESOURCE_GROUP, KIND_MACOS_THERMAL_SENSOR, NETWORK_RECEIVED_BYTES_METRIC,
     NETWORK_TOTAL_RECEIVED_BYTES_METRIC, NETWORK_TOTAL_TRANSMITTED_BYTES_METRIC,
-    NETWORK_TRANSMITTED_BYTES_METRIC, PROCESS_CPU_USAGE_METRIC, PROCESS_DISK_READ_BYTES_METRIC,
-    PROCESS_DISK_WRITE_BYTES_METRIC, PROCESS_MEMORY_BYTES_METRIC, THERMAL_TEMPERATURE_METRIC,
+    NETWORK_TRANSMITTED_BYTES_METRIC, POET_COVERAGE_METRIC, POET_CPU_SECONDS_METRIC,
+    POET_CURRENT_RSS_METRIC, POET_DELIVERY_ACCEPTED_METRIC, POET_DELIVERY_DROPPED_METRIC,
+    POET_DELIVERY_FAILED_METRIC, POET_DELIVERY_REJECTED_METRIC, POET_DELIVERY_UNKNOWN_METRIC,
+    POET_DERIVATION_LAG_METRIC, POET_EFFECTIVE_HORIZON_METRIC, POET_EFFECTIVE_RESOLUTION_METRIC,
+    POET_HEALTH_AGE_METRIC, POET_MANAGED_MEMORY_METRIC, POET_PEAK_RSS_METRIC,
+    POET_QUEUE_BYTES_METRIC, POET_REQUESTED_HORIZON_METRIC, POET_REQUESTED_RESOLUTION_METRIC,
+    POET_SEGMENT_COUNT_METRIC, POET_STORED_BYTES_METRIC, POET_UPTIME_SECONDS_METRIC,
+    PROCESS_CPU_USAGE_METRIC, PROCESS_DISK_READ_BYTES_METRIC, PROCESS_DISK_WRITE_BYTES_METRIC,
+    PROCESS_MEMORY_BYTES_METRIC, THERMAL_TEMPERATURE_METRIC,
 };
 
 const DEFAULT_TOP_PROCESSES: usize = 40;
 
+/// Collector endpoint, sampling cadence, and optional sampling features.
 #[derive(Debug, Parser)]
 #[command(about = "Send local macOS host, resource, and process metrics to Infinite Haiku Poet")]
 struct Args {
+    /// Every Poet of the cluster, comma-separated. The Muse sends to one and
+    /// fails over to the next; the Poets replicate among themselves.
     #[arg(
         long,
         env = "IH_MUSE_POET_URL",
-        default_value = "http://127.0.0.1:8000"
+        default_value = "http://127.0.0.1:8000",
+        value_delimiter = ','
     )]
-    poet_url: String,
+    poet_url: Vec<String>,
+    /// Tenant (organization) the Poets' intake token is scoped to.
+    #[arg(long, env = "IH_MUSE_ORGANIZATION", default_value = "local")]
+    organization: String,
     #[arg(long, env = "IH_MUSE_INTERVAL_SECONDS", default_value_t = 5)]
     interval_seconds: u64,
     #[arg(
@@ -53,6 +68,8 @@ struct Args {
     once: bool,
     #[arg(long, env = "IH_MUSE_SAMPLE_COUNT")]
     samples: Option<u32>,
+    #[arg(long, env = "IH_MUSE_POET_TOKEN_PATH")]
+    poet_token_path: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -62,21 +79,28 @@ async fn main() -> Result<()> {
         anyhow::bail!("--once and --samples cannot be used together");
     }
 
-    let client = PoetClient::new(&[args.poet_url.clone()]);
-    client.register_metrics(&metric_definitions()).await?;
-    client
-        .register_element_kinds(&element_kind_definitions())
-        .await?;
+    let poet_token = args
+        .poet_token_path
+        .as_deref()
+        .map(read_private_token)
+        .transpose()?
+        .context("--poet-token-path is required: graph intake is authenticated")?;
+    let client = GraphPoetClient::cluster(args.poet_url.clone(), poet_token.clone())?;
 
-    let mut registry = ElementRegistry::default();
-    let static_elements = register_static_elements(&client, &mut registry).await?;
+    let mut registry = ElementRegistry::new(&args.organization, hostname(), &metric_definitions());
+    let static_elements = register_static_elements(&mut registry);
     let mut sampler = Sampler::new();
     let sample_limit = args.samples.or_else(|| args.once.then_some(1));
     let mut samples_sent = 0;
+    let mut pending = PendingSamples::<GraphIntakeRequest>::new(MAX_PENDING_SAMPLES);
+    let telemetry_client = reqwest::Client::builder()
+        .timeout(Duration::from_millis(500))
+        .build()?;
+    let poet_token = Some(poet_token);
 
     println!(
-        "macOS Muse sending to {} every {}s; top process cap: {}",
-        args.poet_url,
+        "macOS Muse sending to {} (failover in that order) every {}s; top process cap: {}",
+        args.poet_url.join(", "),
         args.interval_seconds.max(1),
         args.top_processes
     );
@@ -84,11 +108,33 @@ async fn main() -> Result<()> {
         "Hierarchy: host -> resource groups -> cores, memory areas, volumes, interfaces, battery, sensors, applications -> processes"
     );
 
+    // Keep sampling cadence independent of collection and upload duration.
+    let mut cadence = tokio::time::interval(Duration::from_secs(args.interval_seconds.max(1)));
+    cadence.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
+        cadence.tick().await;
         let snapshot_time = timestamp();
-        let snapshot = sampler.collect(snapshot_time, args.top_processes, args.process_network);
-        let published =
-            publish_snapshot(&client, &mut registry, &static_elements, &snapshot).await?;
+        let mut snapshot = sampler.collect(snapshot_time, args.top_processes, args.process_network);
+        snapshot.poet_health =
+            collect_poet_health(&telemetry_client, client.preferred_endpoint(), poet_token.as_deref()).await;
+        // A Poet restart or network error must not stop the Muse or lose the
+        // sample: unsent samples stay queued and are retried in order, on any Poet.
+        let published = publish_snapshot(&mut registry, &static_elements, &snapshot);
+        let observed_at = u64::try_from(timestamp()).unwrap_or(0).saturating_mul(1_000);
+        let request = registry.intake(published.timestamp, &published.payloads, observed_at);
+        let dropped = pending.push(request);
+        if dropped > 0 {
+            eprintln!(
+                "Poet unreachable for over {MAX_PENDING_SAMPLES} samples; dropped {dropped} oldest (total {})",
+                pending.dropped_samples()
+            );
+        }
+        if let Err(error) = send_pending(&client, &mut pending).await {
+            eprintln!(
+                "Poet send failed; {} sample(s) queued for retry: {error:#}",
+                pending.len()
+            );
+        }
 
         samples_sent += 1;
         println!(
@@ -108,44 +154,16 @@ async fn main() -> Result<()> {
         );
 
         if sample_limit.is_some_and(|limit| samples_sent >= limit) {
-            return client.shutdown().await.map_err(Into::into);
+            send_pending(&client, &mut pending).await?;
+            return Ok(());
         }
-        tokio::time::sleep(Duration::from_secs(args.interval_seconds.max(1))).await;
     }
 }
 
-#[derive(Default)]
-struct ElementRegistry {
-    ids: HashMap<String, u64>,
-}
+/// Collector keys mapped to deterministic graph identities (no Poet round trip).
+type ElementRegistry = GraphRegistry;
 
-impl ElementRegistry {
-    async fn ensure(
-        &mut self,
-        client: &PoetClient,
-        key: String,
-        kind_code: &str,
-        name: String,
-        parent_id: Option<u64>,
-        metadata: HashMap<String, String>,
-    ) -> Result<u64> {
-        if let Some(id) = self.ids.get(&key) {
-            return Ok(*id);
-        }
-        let mut results = client
-            .register_elements(&[ElementRegistration::new(
-                kind_code, name, metadata, parent_id,
-            )])
-            .await?;
-        let id = results
-            .pop()
-            .context("Poet did not return an element registration result")?
-            .map_err(|error| anyhow::anyhow!("{error}"))?;
-        self.ids.insert(key, id);
-        Ok(id)
-    }
-}
-
+/// Poet IDs for the fixed host resource hierarchy.
 struct StaticElements {
     cpu_group_id: u64,
     storage_group_id: u64,
@@ -159,72 +177,59 @@ struct StaticElements {
     load_average_id: u64,
 }
 
-async fn register_static_elements(
-    client: &PoetClient,
-    registry: &mut ElementRegistry,
-) -> Result<StaticElements> {
+fn register_static_elements(registry: &mut ElementRegistry) -> StaticElements {
     let host_id = registry
         .ensure(
-            client,
             "host".to_string(),
             KIND_MACOS_HOST,
             hostname(),
             None,
             metadata([("scope", "host")]),
-        )
-        .await?;
-    let cpu_group_id = ensure_group(client, registry, host_id, "CPU", "cpu").await?;
-    let memory_group_id = ensure_group(client, registry, host_id, "Memory", "memory").await?;
-    let storage_group_id = ensure_group(client, registry, host_id, "Storage", "storage").await?;
-    let network_group_id = ensure_group(client, registry, host_id, "Network", "network").await?;
-    let power_group_id = ensure_group(client, registry, host_id, "Power", "power").await?;
-    let thermal_group_id = ensure_group(client, registry, host_id, "Thermal", "thermal").await?;
+        );
+    let cpu_group_id = ensure_group(registry, host_id, "CPU", "cpu");
+    let memory_group_id = ensure_group(registry, host_id, "Memory", "memory");
+    let storage_group_id = ensure_group(registry, host_id, "Storage", "storage");
+    let network_group_id = ensure_group(registry, host_id, "Network", "network");
+    let power_group_id = ensure_group(registry, host_id, "Power", "power");
+    let thermal_group_id = ensure_group(registry, host_id, "Thermal", "thermal");
     let applications_group_id =
-        ensure_group(client, registry, host_id, "Applications", "applications").await?;
-    let system_group_id = ensure_group(client, registry, host_id, "System", "system").await?;
+        ensure_group(registry, host_id, "Applications", "applications");
+    let system_group_id = ensure_group(registry, host_id, "System", "system");
 
     let total_cpu_id = registry
         .ensure(
-            client,
             "resource:cpu:total".to_string(),
             KIND_MACOS_RESOURCE,
             "Total CPU".to_string(),
             Some(cpu_group_id),
             metadata([("resource", "cpu"), ("level", "host")]),
-        )
-        .await?;
+        );
     let physical_memory_id = registry
         .ensure(
-            client,
             "resource:memory:physical".to_string(),
             KIND_MACOS_RESOURCE,
             "Physical memory".to_string(),
             Some(memory_group_id),
             metadata([("resource", "memory"), ("level", "host")]),
-        )
-        .await?;
+        );
     let swap_id = registry
         .ensure(
-            client,
             "resource:memory:swap".to_string(),
             KIND_MACOS_RESOURCE,
             "Swap".to_string(),
             Some(memory_group_id),
             metadata([("resource", "swap"), ("level", "host")]),
-        )
-        .await?;
+        );
     let load_average_id = registry
         .ensure(
-            client,
             "resource:system:load".to_string(),
             KIND_MACOS_RESOURCE,
             "Load average".to_string(),
             Some(system_group_id),
             metadata([("resource", "load"), ("level", "host")]),
-        )
-        .await?;
+        );
 
-    Ok(StaticElements {
+    StaticElements {
         cpu_group_id,
         storage_group_id,
         network_group_id,
@@ -235,28 +240,21 @@ async fn register_static_elements(
         physical_memory_id,
         swap_id,
         load_average_id,
-    })
+    }
 }
 
-async fn ensure_group(
-    client: &PoetClient,
-    registry: &mut ElementRegistry,
-    host_id: u64,
-    name: &str,
-    key: &str,
-) -> Result<u64> {
+fn ensure_group(registry: &mut ElementRegistry, host_id: u64, name: &str, key: &str) -> u64 {
     registry
         .ensure(
-            client,
             format!("group:{key}"),
             KIND_MACOS_RESOURCE_GROUP,
             name.to_string(),
             Some(host_id),
             metadata([("resource_group", key)]),
         )
-        .await
 }
 
+/// Retains OS sampling state needed to compute deltas between observations.
 struct Sampler {
     system: System,
     disks: Disks,
@@ -312,6 +310,7 @@ impl Sampler {
         let process_network = self.collect_process_network(process_network_enabled);
 
         CollectedSnapshot {
+            poet_health: None,
             host: snapshot_from_values(
                 self.system.global_cpu_usage(),
                 self.system.used_memory(),
@@ -379,7 +378,9 @@ impl Sampler {
     }
 }
 
+/// One collection pass before dynamic element registration and publication.
 struct CollectedSnapshot {
+    poet_health: Option<PoetHealthSample>,
     host: ih_muse_macos::HostSnapshot,
     cpu_cores: Vec<CpuCoreSample>,
     disks: Vec<DiskSample>,
@@ -389,12 +390,225 @@ struct CollectedSnapshot {
     processes: Vec<ProcessSample>,
 }
 
+/// Bounded, authenticated self-health returned by the observed Poet process.
+#[derive(serde::Deserialize)]
+struct PoetHealthSample {
+    observed_unix_nano: u64,
+    process: PoetProcessHealth,
+    native_storage: Option<PoetNativeStorageHealth>,
+}
+
+#[derive(serde::Deserialize)]
+struct PoetProcessHealth {
+    pid: u32,
+    cpu_seconds: Option<f64>,
+    uptime_seconds: f64,
+    rss_bytes: Option<u64>,
+    peak_rss_bytes: Option<u64>,
+}
+
+#[derive(serde::Deserialize)]
+struct PoetNativeStorageHealth {
+    managed_memory_bytes: u64,
+    queue_bytes: u64,
+    segment_count: u64,
+    coverage_fraction: f64,
+    requested_resolution_unix_nano: Option<u64>,
+    effective_resolution_unix_nano: Option<u64>,
+    requested_horizon_unix_nano: Option<u64>,
+    effective_horizon_unix_nano: Option<u64>,
+    derivation_lag_unix_nano: u64,
+    roots: Vec<PoetStorageRootHealth>,
+    outcomes: PoetDeliveryOutcomes,
+}
+
+#[derive(serde::Deserialize)]
+struct PoetStorageRootHealth {
+    stored_bytes: u64,
+    available: bool,
+}
+
+#[derive(serde::Deserialize)]
+struct PoetDeliveryOutcomes {
+    accepted: u64,
+    rejected: u64,
+    dropped: u64,
+    failed: u64,
+    unknown: u64,
+}
+
+impl PoetHealthSample {
+    fn readings_for(&self, pid: u32, collected_unix_micro: i64) -> Vec<Option<MetricReading>> {
+        if pid != self.process.pid {
+            return Vec::new();
+        }
+        let age_seconds = (u64::try_from(collected_unix_micro)
+            .unwrap_or_default()
+            .saturating_mul(1_000)
+            .saturating_sub(self.observed_unix_nano) as f64
+            / 1_000_000_000.0) as f32;
+        let mut readings = vec![
+            self.process
+                .cpu_seconds
+                .and_then(|value| MetricReading::new(POET_CPU_SECONDS_METRIC, value)),
+            MetricReading::new(
+                POET_UPTIME_SECONDS_METRIC,
+                self.process.uptime_seconds,
+            ),
+            self.process
+                .rss_bytes
+                .and_then(|value| MetricReading::new(POET_CURRENT_RSS_METRIC, value as f64)),
+            self.process
+                .peak_rss_bytes
+                .and_then(|value| MetricReading::new(POET_PEAK_RSS_METRIC, value as f64)),
+            MetricReading::new(POET_HEALTH_AGE_METRIC, age_seconds),
+        ];
+        if let Some(storage) = &self.native_storage {
+            let stored_bytes = storage
+                .roots
+                .iter()
+                .filter(|root| root.available)
+                .map(|root| root.stored_bytes)
+                .sum::<u64>();
+            readings.extend([
+                MetricReading::new(
+                    POET_MANAGED_MEMORY_METRIC,
+                    storage.managed_memory_bytes as f64,
+                ),
+                MetricReading::new(POET_QUEUE_BYTES_METRIC, storage.queue_bytes as f64),
+                MetricReading::new(POET_STORED_BYTES_METRIC, stored_bytes as f64),
+                MetricReading::new(POET_SEGMENT_COUNT_METRIC, storage.segment_count as f64),
+                MetricReading::new(POET_COVERAGE_METRIC, storage.coverage_fraction),
+                storage.requested_resolution_unix_nano.and_then(|value| {
+                    MetricReading::new(POET_REQUESTED_RESOLUTION_METRIC, value as f64)
+                }),
+                storage.effective_resolution_unix_nano.and_then(|value| {
+                    MetricReading::new(POET_EFFECTIVE_RESOLUTION_METRIC, value as f64)
+                }),
+                storage.requested_horizon_unix_nano.and_then(|value| {
+                    MetricReading::new(POET_REQUESTED_HORIZON_METRIC, value as f64)
+                }),
+                storage.effective_horizon_unix_nano.and_then(|value| {
+                    MetricReading::new(POET_EFFECTIVE_HORIZON_METRIC, value as f64)
+                }),
+                MetricReading::new(
+                    POET_DERIVATION_LAG_METRIC,
+                    storage.derivation_lag_unix_nano as f64,
+                ),
+                MetricReading::new(
+                    POET_DELIVERY_ACCEPTED_METRIC,
+                    storage.outcomes.accepted as f64,
+                ),
+                MetricReading::new(
+                    POET_DELIVERY_REJECTED_METRIC,
+                    storage.outcomes.rejected as f64,
+                ),
+                MetricReading::new(
+                    POET_DELIVERY_DROPPED_METRIC,
+                    storage.outcomes.dropped as f64,
+                ),
+                MetricReading::new(POET_DELIVERY_FAILED_METRIC, storage.outcomes.failed as f64),
+                MetricReading::new(
+                    POET_DELIVERY_UNKNOWN_METRIC,
+                    storage.outcomes.unknown as f64,
+                ),
+            ]);
+        }
+        readings
+    }
+}
+
+#[test]
+fn native_health_is_scoped_to_exact_process_with_honest_optional_values() {
+    let sample = PoetHealthSample {
+        observed_unix_nano: 10_000_000_000,
+        process: PoetProcessHealth {
+            pid: 42,
+            cpu_seconds: Some(2.5),
+            uptime_seconds: 9.0,
+            rss_bytes: Some(8192),
+            peak_rss_bytes: Some(16384),
+        },
+        native_storage: Some(PoetNativeStorageHealth {
+            managed_memory_bytes: 1024,
+            queue_bytes: 512,
+            segment_count: 3,
+            coverage_fraction: 0.75,
+            requested_resolution_unix_nano: Some(1_000_000),
+            effective_resolution_unix_nano: None,
+            requested_horizon_unix_nano: Some(60_000_000_000),
+            effective_horizon_unix_nano: None,
+            derivation_lag_unix_nano: 7,
+            roots: vec![PoetStorageRootHealth {
+                stored_bytes: 2048,
+                available: true,
+            }],
+            outcomes: PoetDeliveryOutcomes {
+                accepted: 4,
+                rejected: 1,
+                dropped: 0,
+                failed: 0,
+                unknown: 0,
+            },
+        }),
+    };
+    assert!(sample.readings_for(43, 10_000_000).is_empty());
+    let readings = sample.readings_for(42, 10_000_000);
+    assert!(readings
+        .iter()
+        .flatten()
+        .any(|reading| reading.code == POET_CURRENT_RSS_METRIC && reading.value == 8192.0));
+    assert!(readings
+        .iter()
+        .flatten()
+        .any(|reading| reading.code == POET_COVERAGE_METRIC && reading.value == 0.75));
+    assert!(!readings
+        .iter()
+        .flatten()
+        .any(|reading| reading.code == POET_EFFECTIVE_RESOLUTION_METRIC));
+}
+
+fn read_private_token(path: &Path) -> Result<String> {
+    let token = std::fs::read_to_string(path)
+        .with_context(|| format!("cannot read Poet credential from {}", path.display()))?;
+    let token = token.trim().to_owned();
+    anyhow::ensure!(
+        !token.is_empty() && token.len() <= 4096,
+        "Poet credential is empty or too large"
+    );
+    Ok(token)
+}
+
+async fn collect_poet_health(
+    client: &reqwest::Client,
+    poet_url: &str,
+    token: Option<&str>,
+) -> Option<PoetHealthSample> {
+    let token = token?;
+    client
+        .get(format!(
+            "{}/api/v1/telemetry/stats",
+            poet_url.trim_end_matches('/')
+        ))
+        .bearer_auth(token)
+        .send()
+        .await
+        .ok()?
+        .error_for_status()
+        .ok()?
+        .json()
+        .await
+        .ok()
+}
+
+/// Utilization of one logical CPU core in percent.
 struct CpuCoreSample {
     index: usize,
     name: String,
     usage_percent: f32,
 }
 
+/// Capacity and occupied space for one mounted volume.
 struct DiskSample {
     key: String,
     name: String,
@@ -404,6 +618,7 @@ struct DiskSample {
     total_bytes: u64,
 }
 
+/// Per-interface byte deltas and lifetime counters.
 struct NetworkInterfaceSample {
     key: String,
     name: String,
@@ -413,11 +628,13 @@ struct NetworkInterfaceSample {
     total_transmitted_bytes: u64,
 }
 
+/// Battery state plus an optional observed discharge rate.
 struct BatteryReading {
     snapshot: BatterySnapshot,
     drain_percent_per_hour: Option<f32>,
 }
 
+/// Named thermal sensor observation in degrees Celsius.
 struct ThermalSensorSample {
     key: String,
     name: String,
@@ -425,6 +642,7 @@ struct ThermalSensorSample {
 }
 
 #[derive(Clone)]
+/// Process identity and resource observations, including optional network bytes.
 struct ProcessSample {
     key: String,
     app_key: String,
@@ -442,32 +660,119 @@ struct ProcessSample {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// Network byte observations attributed to a process by nettop.
 struct ProcessNetworkSample {
     received_bytes: u64,
     transmitted_bytes: u64,
 }
 
+/// Timestamp and payload count of a successfully published collection.
 struct PublishedSample {
     timestamp: i64,
     payload_count: usize,
+    payloads: Vec<MetricPayload>,
 }
 
+/// Samples kept while Poet is unreachable: 10 minutes at the default 5 s cadence.
+const MAX_PENDING_SAMPLES: usize = 120;
+
+/// Dynamic Poet element IDs aligned with a collected snapshot's resource lists.
 struct RegisteredSnapshotElements {
     cpu_core_ids: Vec<u64>,
     disk_ids: Vec<u64>,
     network_interface_ids: Vec<u64>,
     battery_id: Option<u64>,
     thermal_sensor_ids: Vec<u64>,
-    process_ids: Vec<u64>,
+    processes: Vec<RegisteredProcess>,
 }
 
-async fn publish_snapshot(
-    client: &PoetClient,
+/// Poet IDs for a process leaf and its stable application parent.
+struct RegisteredProcess {
+    application_id: u64,
+    process_id: u64,
+}
+
+#[derive(Default)]
+/// Additive resource observations for the sampled processes of one application.
+struct ApplicationTotals {
+    cpu_usage_percent: f32,
+    memory_bytes: u64,
+    disk_read_bytes: u64,
+    disk_write_bytes: u64,
+    network_received_bytes: u64,
+    network_transmitted_bytes: u64,
+    has_network_received: bool,
+    has_network_transmitted: bool,
+}
+
+impl ApplicationTotals {
+    fn add(&mut self, process: &ProcessSample) {
+        self.cpu_usage_percent += process.cpu_usage_percent;
+        self.memory_bytes = self.memory_bytes.saturating_add(process.memory_bytes);
+        self.disk_read_bytes = self.disk_read_bytes.saturating_add(process.disk_read_bytes);
+        self.disk_write_bytes = self
+            .disk_write_bytes
+            .saturating_add(process.disk_write_bytes);
+        if let Some(value) = process.network_received_bytes {
+            self.network_received_bytes = self.network_received_bytes.saturating_add(value);
+            self.has_network_received = true;
+        }
+        if let Some(value) = process.network_transmitted_bytes {
+            self.network_transmitted_bytes = self.network_transmitted_bytes.saturating_add(value);
+            self.has_network_transmitted = true;
+        }
+    }
+}
+
+#[test]
+fn application_totals_preserve_sampled_process_resource_sums() {
+    let first = ProcessSample {
+        key: "process:1:1".into(),
+        app_key: "app:demo".into(),
+        app_name: "Demo".into(),
+        name: "demo".into(),
+        pid: 1,
+        parent_pid: None,
+        start_time: 1,
+        cpu_usage_percent: 12.5,
+        memory_bytes: 10,
+        disk_read_bytes: 2,
+        disk_write_bytes: 3,
+        network_received_bytes: Some(4),
+        network_transmitted_bytes: None,
+    };
+    let second = ProcessSample {
+        pid: 2,
+        cpu_usage_percent: 7.5,
+        memory_bytes: 20,
+        disk_read_bytes: 5,
+        disk_write_bytes: 7,
+        network_received_bytes: None,
+        network_transmitted_bytes: Some(11),
+        ..first.clone()
+    };
+    let mut total = ApplicationTotals::default();
+    total.add(&first);
+    total.add(&second);
+    assert_eq!(total.cpu_usage_percent, 20.0);
+    assert_eq!(total.memory_bytes, 30);
+    assert_eq!((total.disk_read_bytes, total.disk_write_bytes), (7, 10));
+    assert_eq!(
+        (
+            total.network_received_bytes,
+            total.network_transmitted_bytes
+        ),
+        (4, 11)
+    );
+    assert!(total.has_network_received && total.has_network_transmitted);
+}
+
+fn publish_snapshot(
     registry: &mut ElementRegistry,
     static_elements: &StaticElements,
     snapshot: &CollectedSnapshot,
-) -> Result<PublishedSample> {
-    let registered = ensure_snapshot_elements(client, registry, static_elements, snapshot).await?;
+) -> PublishedSample {
+    let registered = ensure_snapshot_elements(registry, static_elements, snapshot);
     let now = timestamp();
     let mut payloads = Vec::new();
     if let Some(payload) = snapshot.host.cpu_metrics(now, static_elements.total_cpu_id) {
@@ -508,8 +813,8 @@ async fn publish_snapshot(
             element_id,
             [
                 MetricReading::new(DISK_USAGE_METRIC, disk.usage_percent),
-                MetricReading::new(DISK_USED_BYTES_METRIC, disk.used_bytes as f32),
-                MetricReading::new(DISK_AVAILABLE_BYTES_METRIC, disk.available_bytes as f32),
+                MetricReading::new(DISK_USED_BYTES_METRIC, disk.used_bytes as f64),
+                MetricReading::new(DISK_AVAILABLE_BYTES_METRIC, disk.available_bytes as f64),
             ],
         );
     }
@@ -526,19 +831,19 @@ async fn publish_snapshot(
             [
                 MetricReading::new(
                     NETWORK_RECEIVED_BYTES_METRIC,
-                    interface.received_bytes as f32,
+                    interface.received_bytes as f64,
                 ),
                 MetricReading::new(
                     NETWORK_TRANSMITTED_BYTES_METRIC,
-                    interface.transmitted_bytes as f32,
+                    interface.transmitted_bytes as f64,
                 ),
                 MetricReading::new(
                     NETWORK_TOTAL_RECEIVED_BYTES_METRIC,
-                    interface.total_received_bytes as f32,
+                    interface.total_received_bytes as f64,
                 ),
                 MetricReading::new(
                     NETWORK_TOTAL_TRANSMITTED_BYTES_METRIC,
-                    interface.total_transmitted_bytes as f32,
+                    interface.total_transmitted_bytes as f64,
                 ),
             ],
         );
@@ -582,60 +887,133 @@ async fn publish_snapshot(
         );
     }
 
-    for (process, process_id) in snapshot.processes.iter().zip(registered.process_ids) {
+    let mut applications = BTreeMap::<u64, ApplicationTotals>::new();
+    for (process, registered_process) in snapshot.processes.iter().zip(&registered.processes) {
         push_payload(
             &mut payloads,
             now,
-            process_id,
+            registered_process.process_id,
             [
                 MetricReading::new(PROCESS_CPU_USAGE_METRIC, process.cpu_usage_percent),
-                MetricReading::new(PROCESS_MEMORY_BYTES_METRIC, process.memory_bytes as f32),
+                ih_muse_macos::cpu_capacity_percent(
+                    process.cpu_usage_percent,
+                    snapshot.cpu_cores.len(),
+                )
+                .and_then(|value| {
+                    MetricReading::new(ih_muse_macos::PROCESS_CPU_CAPACITY_METRIC, value)
+                }),
+                MetricReading::new(PROCESS_MEMORY_BYTES_METRIC, process.memory_bytes as f64),
                 MetricReading::new(
                     PROCESS_DISK_READ_BYTES_METRIC,
-                    process.disk_read_bytes as f32,
+                    process.disk_read_bytes as f64,
                 ),
                 MetricReading::new(
                     PROCESS_DISK_WRITE_BYTES_METRIC,
-                    process.disk_write_bytes as f32,
+                    process.disk_write_bytes as f64,
                 ),
                 process.network_received_bytes.and_then(|value| {
                     MetricReading::new(
                         ih_muse_macos::PROCESS_NETWORK_RECEIVED_BYTES_METRIC,
-                        value as f32,
+                        value as f64,
                     )
                 }),
                 process.network_transmitted_bytes.and_then(|value| {
                     MetricReading::new(
                         ih_muse_macos::PROCESS_NETWORK_TRANSMITTED_BYTES_METRIC,
-                        value as f32,
+                        value as f64,
                     )
                 }),
+            ]
+            .into_iter()
+            .chain(
+                snapshot
+                    .poet_health
+                    .iter()
+                    .flat_map(|health| health.readings_for(process.pid, now)),
+            ),
+        );
+        applications
+            .entry(registered_process.application_id)
+            .or_default()
+            .add(process);
+    }
+    for (application_id, totals) in applications {
+        push_payload(
+            &mut payloads,
+            now,
+            application_id,
+            [
+                MetricReading::new(PROCESS_CPU_USAGE_METRIC, totals.cpu_usage_percent),
+                ih_muse_macos::cpu_capacity_percent(
+                    totals.cpu_usage_percent,
+                    snapshot.cpu_cores.len(),
+                )
+                .and_then(|value| {
+                    MetricReading::new(ih_muse_macos::PROCESS_CPU_CAPACITY_METRIC, value)
+                }),
+                MetricReading::new(PROCESS_MEMORY_BYTES_METRIC, totals.memory_bytes as f64),
+                MetricReading::new(
+                    PROCESS_DISK_READ_BYTES_METRIC,
+                    totals.disk_read_bytes as f64,
+                ),
+                MetricReading::new(
+                    PROCESS_DISK_WRITE_BYTES_METRIC,
+                    totals.disk_write_bytes as f64,
+                ),
+                totals
+                    .has_network_received
+                    .then(|| {
+                        MetricReading::new(
+                            ih_muse_macos::PROCESS_NETWORK_RECEIVED_BYTES_METRIC,
+                            totals.network_received_bytes as f64,
+                        )
+                    })
+                    .flatten(),
+                totals
+                    .has_network_transmitted
+                    .then(|| {
+                        MetricReading::new(
+                            ih_muse_macos::PROCESS_NETWORK_TRANSMITTED_BYTES_METRIC,
+                            totals.network_transmitted_bytes as f64,
+                        )
+                    })
+                    .flatten(),
             ],
         );
     }
 
-    let payload_count = payloads.len();
-    if payload_count > 0 {
-        client.send_metrics(payloads, None).await?;
-    }
-    Ok(PublishedSample {
+    PublishedSample {
         timestamp: now,
-        payload_count,
-    })
+        payload_count: payloads.len(),
+        payloads,
+    }
 }
 
-async fn ensure_snapshot_elements(
-    client: &PoetClient,
+/// Sends queued samples oldest first and stops at the first failure, which
+/// stays queued for the next tick. Returns how many samples were sent.
+async fn send_pending(
+    client: &GraphPoetClient,
+    pending: &mut PendingSamples<GraphIntakeRequest>,
+) -> Result<usize> {
+    let mut sent = 0;
+    while let Some(request) = pending.oldest() {
+        client.publish(request).await?;
+        pending.acknowledge_oldest();
+        sent += 1;
+    }
+    Ok(sent)
+}
+
+fn ensure_snapshot_elements(
     registry: &mut ElementRegistry,
     static_elements: &StaticElements,
     snapshot: &CollectedSnapshot,
-) -> Result<RegisteredSnapshotElements> {
+) -> RegisteredSnapshotElements {
     let mut cpu_core_ids = Vec::with_capacity(snapshot.cpu_cores.len());
     for core in &snapshot.cpu_cores {
         cpu_core_ids.push(
             registry
                 .ensure(
-                    client,
                     format!("cpu-core:{}", core.index),
                     KIND_MACOS_CPU_CORE,
                     core.name.clone(),
@@ -645,8 +1023,7 @@ async fn ensure_snapshot_elements(
                         ("level", "core"),
                         ("core_index", &core.index.to_string()),
                     ]),
-                )
-                .await?,
+                ),
         );
     }
 
@@ -655,14 +1032,12 @@ async fn ensure_snapshot_elements(
         disk_ids.push(
             registry
                 .ensure(
-                    client,
                     disk.key.clone(),
                     KIND_MACOS_DISK_VOLUME,
                     disk.name.clone(),
                     Some(static_elements.storage_group_id),
                     metadata([("resource", "disk"), ("level", "volume")]),
-                )
-                .await?,
+                ),
         );
     }
 
@@ -671,14 +1046,12 @@ async fn ensure_snapshot_elements(
         network_interface_ids.push(
             registry
                 .ensure(
-                    client,
                     interface.key.clone(),
                     KIND_MACOS_NETWORK_INTERFACE,
                     interface.name.clone(),
                     Some(static_elements.network_group_id),
                     metadata([("resource", "network"), ("level", "interface")]),
-                )
-                .await?,
+                ),
         );
     }
 
@@ -686,14 +1059,12 @@ async fn ensure_snapshot_elements(
         Some(
             registry
                 .ensure(
-                    client,
                     "power:battery:internal".to_string(),
                     KIND_MACOS_POWER_SOURCE,
                     "Internal battery".to_string(),
                     Some(static_elements.power_group_id),
                     metadata([("resource", "battery"), ("level", "power_source")]),
-                )
-                .await?,
+                ),
         )
     } else {
         None
@@ -704,57 +1075,53 @@ async fn ensure_snapshot_elements(
         thermal_sensor_ids.push(
             registry
                 .ensure(
-                    client,
                     sensor.key.clone(),
                     KIND_MACOS_THERMAL_SENSOR,
                     sensor.name.clone(),
                     Some(static_elements.thermal_group_id),
                     metadata([("resource", "thermal"), ("level", "sensor")]),
-                )
-                .await?,
+                ),
         );
     }
 
-    let mut process_ids = Vec::with_capacity(snapshot.processes.len());
+    let mut processes = Vec::with_capacity(snapshot.processes.len());
     for process in &snapshot.processes {
         let app_id = registry
             .ensure(
-                client,
                 process.app_key.clone(),
                 KIND_MACOS_APPLICATION,
                 process.app_name.clone(),
                 Some(static_elements.applications_group_id),
                 metadata([("resource", "process"), ("level", "application")]),
-            )
-            .await?;
-        process_ids.push(
-            registry
-                .ensure(
-                    client,
-                    process.key.clone(),
-                    KIND_MACOS_PROCESS,
-                    format!("{} ({})", process.name, process.pid),
-                    Some(app_id),
-                    metadata([
-                        ("resource", "process"),
-                        ("level", "process"),
-                        ("pid", &process.pid.to_string()),
-                        ("parent_pid", &optional_u32(process.parent_pid)),
-                        ("start_time", &process.start_time.to_string()),
-                    ]),
-                )
-                .await?,
-        );
+            );
+        let process_id = registry
+            .ensure(
+                process.key.clone(),
+                KIND_MACOS_PROCESS,
+                format!("{} ({})", process.name, process.pid),
+                Some(app_id),
+                metadata([
+                    ("resource", "process"),
+                    ("level", "process"),
+                    ("pid", &process.pid.to_string()),
+                    ("parent_pid", &optional_u32(process.parent_pid)),
+                    ("start_time", &process.start_time.to_string()),
+                ]),
+            );
+        processes.push(RegisteredProcess {
+            application_id: app_id,
+            process_id,
+        });
     }
 
-    Ok(RegisteredSnapshotElements {
+    RegisteredSnapshotElements {
         cpu_core_ids,
         disk_ids,
         network_interface_ids,
         battery_id,
         thermal_sensor_ids,
-        process_ids,
-    })
+        processes,
+    }
 }
 
 fn push_payload(
@@ -865,8 +1232,25 @@ fn collect_processes(
             .then_with(|| left.name.cmp(&right.name))
             .then_with(|| left.pid.cmp(&right.pid))
     });
-    processes.truncate(top_processes.max(1));
+    let mut rank = 0;
+    processes.retain(|process| {
+        let keep = retain_process(rank, top_processes, &process.name);
+        rank += 1;
+        keep
+    });
     processes
+}
+
+fn retain_process(rank: usize, top_processes: usize, name: &str) -> bool {
+    rank < top_processes.max(1) || matches!(name, "poet" | "ih-muse-macos")
+}
+
+#[test]
+fn self_observation_is_independent_of_process_ranking() {
+    assert!(retain_process(100, 12, "poet"));
+    assert!(retain_process(100, 12, "ih-muse-macos"));
+    assert!(!retain_process(100, 12, "other"));
+    assert!(retain_process(0, 12, "other"));
 }
 
 fn read_nettop_process_network() -> Result<HashMap<String, ProcessNetworkSample>> {

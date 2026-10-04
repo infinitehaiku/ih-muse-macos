@@ -1,5 +1,6 @@
 pub mod dashboards;
 pub mod graph;
+pub mod logs;
 
 use ih_muse_proto::{
     metric_id_from_code, ElementKindRegistration, MetricDefinition, MetricPayload,
@@ -50,6 +51,20 @@ pub const POET_DELIVERY_REJECTED_METRIC: &str = "process.poet.delivery.rejected"
 pub const POET_DELIVERY_DROPPED_METRIC: &str = "process.poet.delivery.dropped";
 pub const POET_DELIVERY_FAILED_METRIC: &str = "process.poet.delivery.failed";
 pub const POET_DELIVERY_UNKNOWN_METRIC: &str = "process.poet.delivery.unknown";
+/// The Muse's unified log collection (counters since start, on the "Log
+/// collection" element; `queued` is a level).
+pub const MUSE_LOGS_COLLECTED_METRIC: &str = "muse.logs.collected";
+pub const MUSE_LOGS_SENT_METRIC: &str = "muse.logs.sent";
+pub const MUSE_LOGS_FILTERED_METRIC: &str = "muse.logs.filtered_at_muse";
+pub const MUSE_LOGS_DROPPED_RATE_METRIC: &str = "muse.logs.dropped_rate_limited";
+pub const MUSE_LOGS_DROPPED_QUEUE_METRIC: &str = "muse.logs.dropped_queue_full";
+pub const MUSE_LOGS_DROPPED_REJECTED_METRIC: &str = "muse.logs.dropped_rejected";
+pub const MUSE_LOGS_UNPARSABLE_METRIC: &str = "muse.logs.unparsable";
+pub const MUSE_LOGS_TRUNCATED_METRIC: &str = "muse.logs.truncated";
+pub const MUSE_LOGS_REDACTED_METRIC: &str = "muse.logs.redacted";
+pub const MUSE_LOGS_SEND_FAILURES_METRIC: &str = "muse.logs.send_failures";
+pub const MUSE_LOGS_RESTARTS_METRIC: &str = "muse.logs.stream_restarts";
+pub const MUSE_LOGS_QUEUED_METRIC: &str = "muse.logs.queued";
 
 /// Converts one-core percentages into a share of the machine's logical CPU capacity.
 pub fn cpu_capacity_percent(core_percent: f32, logical_cpus: usize) -> Option<f32> {
@@ -427,7 +442,60 @@ pub fn metric_definitions() -> Vec<MetricDefinition> {
             .into();
         }
     }
+    definitions.extend(muse_log_metric_definitions());
     definitions
+}
+
+/// Definitions of the unified log collection counters ([`logs::LogStats`]).
+fn muse_log_metric_definitions() -> Vec<MetricDefinition> {
+    [
+        (MUSE_LOGS_COLLECTED_METRIC, "Logs collected", "Unified log records kept by the Muse"),
+        (MUSE_LOGS_SENT_METRIC, "Logs sent", "Log records a Poet acknowledged"),
+        (MUSE_LOGS_FILTERED_METRIC, "Logs filtered at Muse", "Lines the Muse read but did not keep"),
+        (MUSE_LOGS_DROPPED_RATE_METRIC, "Logs over rate", "Records dropped by the rate limit"),
+        (MUSE_LOGS_DROPPED_QUEUE_METRIC, "Logs over queue", "Oldest records dropped while no Poet accepted them"),
+        (MUSE_LOGS_DROPPED_REJECTED_METRIC, "Logs refused", "Records a Poet refused"),
+        (MUSE_LOGS_UNPARSABLE_METRIC, "Logs unreadable", "Lines skipped as unreadable or too long"),
+        (MUSE_LOGS_TRUNCATED_METRIC, "Logs cut", "Records whose text was cut to the size limit"),
+        (MUSE_LOGS_REDACTED_METRIC, "Logs redacted", "Records with user paths or addresses masked"),
+        (MUSE_LOGS_SEND_FAILURES_METRIC, "Log send failures", "Log requests no Poet answered"),
+        (MUSE_LOGS_RESTARTS_METRIC, "Log stream restarts", "Times the unified log stream was restarted"),
+        (MUSE_LOGS_QUEUED_METRIC, "Logs queued", "Records waiting for a Poet"),
+    ]
+    .into_iter()
+    .map(|(code, name, description)| {
+        let mut definition = MetricDefinition::new(code, name, description);
+        if let Some(display) = &mut definition.display {
+            display.unit = "number".into();
+            display.aggregation = "none".into();
+            display.kind = if code == MUSE_LOGS_QUEUED_METRIC { "gauge" } else { "counter" }.into();
+            display.element_kinds = vec![KIND_MACOS_RESOURCE.into()];
+            display.direction = "neutral".into();
+        }
+        definition
+    })
+    .collect()
+}
+
+/// The readings of the log collection element for one sample.
+pub fn log_stats_readings(stats: &logs::LogStats) -> Vec<MetricReading> {
+    [
+        (MUSE_LOGS_COLLECTED_METRIC, stats.collected),
+        (MUSE_LOGS_SENT_METRIC, stats.sent),
+        (MUSE_LOGS_FILTERED_METRIC, stats.filtered),
+        (MUSE_LOGS_DROPPED_RATE_METRIC, stats.dropped_rate_limited),
+        (MUSE_LOGS_DROPPED_QUEUE_METRIC, stats.dropped_queue_full),
+        (MUSE_LOGS_DROPPED_REJECTED_METRIC, stats.dropped_rejected),
+        (MUSE_LOGS_UNPARSABLE_METRIC, stats.unparsable),
+        (MUSE_LOGS_TRUNCATED_METRIC, stats.truncated),
+        (MUSE_LOGS_REDACTED_METRIC, stats.redacted),
+        (MUSE_LOGS_SEND_FAILURES_METRIC, stats.send_failures),
+        (MUSE_LOGS_RESTARTS_METRIC, stats.stream_restarts),
+        (MUSE_LOGS_QUEUED_METRIC, stats.queued),
+    ]
+    .into_iter()
+    .filter_map(|(code, value)| MetricReading::new(code, value as f64))
+    .collect()
 }
 
 fn poet_metric(code: &str, name: &str, description: &str, unit: &str) -> MetricDefinition {
@@ -566,6 +634,24 @@ fn percentage(numerator: u64, denominator: u64) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_log_collection_reading_has_a_counter_definition() {
+        let definitions = metric_definitions();
+        let stats = logs::LogStats { collected: 3, dropped_rate_limited: 2, queued: 1, ..Default::default() };
+        let readings = log_stats_readings(&stats);
+        assert_eq!(readings.len(), 12);
+        for reading in &readings {
+            let definition = definitions.iter().find(|definition| definition.code == reading.code).expect(reading.code);
+            let display = definition.display.as_ref().unwrap();
+            assert_eq!(display.element_kinds, vec![KIND_MACOS_RESOURCE.to_string()]);
+            let expected = if reading.code == MUSE_LOGS_QUEUED_METRIC { "gauge" } else { "counter" };
+            assert_eq!(display.kind, expected, "{}", reading.code);
+        }
+        assert!(readings.iter().any(|reading| reading.code == MUSE_LOGS_DROPPED_RATE_METRIC && reading.value == 2.0));
+        let codes = definitions.iter().map(|definition| definition.code.as_str()).collect::<std::collections::HashSet<_>>();
+        assert_eq!(codes.len(), definitions.len(), "metric codes stay unique");
+    }
 
     #[test]
     fn pending_samples_keep_unsent_data_in_order_and_bound_memory() {

@@ -738,6 +738,7 @@ dependencies = [
  "ih-muse-client",
  "ih-muse-core",
  "ih-muse-proto",
+ "libc",
  "reqwest",
  "serde",
  "serde_json",

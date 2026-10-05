@@ -2,17 +2,19 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Parser;
 use ih_muse_client::GraphPoetClient;
 use ih_muse_macos::graph::GraphRegistry;
+use ih_muse_macos::logs::{spawn_collector, Delivery, LogBuffer, LogSender, LogSettings, LogStats};
 use ih_muse_proto::{GraphIntakeRequest, MetricPayload};
 use sysinfo::{Components, Disks, Networks, ProcessesToUpdate, System};
 
 use ih_muse_macos::{
-    metric_definitions, metric_payload, parse_pmset_battery,
+    log_stats_readings, metric_definitions, metric_payload, parse_pmset_battery,
     snapshot_from_values, BatterySnapshot, MetricReading, PendingSamples, BATTERY_CHARGE_METRIC,
     BATTERY_CHARGING_METRIC, BATTERY_DRAIN_RATE_METRIC, BATTERY_ON_BATTERY_METRIC,
     CPU_CORE_USAGE_METRIC, DISK_AVAILABLE_BYTES_METRIC, DISK_USAGE_METRIC, DISK_USED_BYTES_METRIC,
@@ -79,6 +81,22 @@ struct Args {
     samples: Option<u32>,
     #[arg(long, env = "IH_MUSE_POET_TOKEN_PATH")]
     poet_token_path: Option<PathBuf>,
+    /// Send a bounded, safe subset of the macOS unified log (sleep and wake,
+    /// battery, crashes, disk mounts, network links, thermal pressure) to
+    /// the Poets as OTLP logs. `--logs false` turns it off.
+    #[arg(long, env = "IH_MUSE_LOGS", default_value = "true", value_parser = clap::value_parser!(bool))]
+    logs: bool,
+    /// Mask user paths, e-mail and network addresses in log text.
+    #[arg(long, env = "IH_MUSE_LOG_REDACT", default_value = "true", value_parser = clap::value_parser!(bool))]
+    log_redact: bool,
+    /// Also collect `logger "ih-muse-test ..."` lines (end-to-end checks).
+    #[arg(long, env = "IH_MUSE_LOG_TEST_HOOK", default_value = "false", value_parser = clap::value_parser!(bool))]
+    log_test_hook: bool,
+    /// Log records per second over all event kinds, and the burst above it.
+    #[arg(long, env = "IH_MUSE_LOG_RATE", default_value_t = 20.0)]
+    log_rate_per_second: f64,
+    #[arg(long, env = "IH_MUSE_LOG_BURST", default_value_t = 200.0)]
+    log_burst: f64,
 }
 
 #[tokio::main]
@@ -95,6 +113,39 @@ async fn main() -> Result<()> {
         .transpose()?
         .context("--poet-token-path is required: graph intake is authenticated")?;
     let client = GraphPoetClient::cluster(args.poet_url.clone(), poet_token.clone())?;
+
+    let log_buffer = if args.logs {
+        let settings = LogSettings {
+            redact: args.log_redact,
+            test_hook: args.log_test_hook,
+            rate_per_second: args.log_rate_per_second,
+            burst: args.log_burst,
+        };
+        let home = std::env::var("HOME").ok();
+        let buffer = Arc::new(Mutex::new(LogBuffer::new(settings, home, std::time::Instant::now())));
+        spawn_collector(Arc::clone(&buffer), args.log_test_hook);
+        let sender = LogSender::new(&args.poet_url, &poet_token, &hostname())?;
+        let (task_buffer, graph_client) = (Arc::clone(&buffer), client.clone());
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(1));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tick.tick().await;
+                while sender.send_once(&task_buffer, graph_client.preferred_endpoint()).await
+                    == Some(Delivery::Sent)
+                {}
+            }
+        });
+        println!(
+            "Unified log collection on (redaction {}, test hook {}, {} records/s)",
+            if args.log_redact { "on" } else { "off" },
+            if args.log_test_hook { "on" } else { "off" },
+            args.log_rate_per_second
+        );
+        Some(buffer)
+    } else {
+        None
+    };
 
     let mut registry = ElementRegistry::new(&args.organization, hostname(), &metric_definitions());
     let static_elements = register_static_elements(&mut registry);
@@ -129,6 +180,9 @@ async fn main() -> Result<()> {
         let mut snapshot = sampler.collect(snapshot_time, args.process_network);
         snapshot.poet_health =
             collect_poet_health(&telemetry_client, client.preferred_endpoint(), poet_token.as_deref()).await;
+        snapshot.log_stats = log_buffer
+            .as_ref()
+            .map(|buffer| buffer.lock().unwrap_or_else(std::sync::PoisonError::into_inner).stats());
         // A Poet restart or network error must not stop the Muse or lose the
         // sample: unsent samples stay queued and are retried in order, on any Poet.
         let published = publish_snapshot(&mut registry, &static_elements, &snapshot);
@@ -188,6 +242,7 @@ struct StaticElements {
     physical_memory_id: u64,
     swap_id: u64,
     load_average_id: u64,
+    log_collection_id: u64,
 }
 
 fn register_static_elements(registry: &mut ElementRegistry) -> StaticElements {
@@ -242,6 +297,14 @@ fn register_static_elements(registry: &mut ElementRegistry) -> StaticElements {
             metadata([("resource", "load"), ("level", "host")]),
         );
 
+    let log_collection_id = registry.ensure(
+        "resource:muse:logs".to_string(),
+        KIND_MACOS_RESOURCE,
+        "Log collection".to_string(),
+        Some(system_group_id),
+        metadata([("resource", "logs"), ("level", "host")]),
+    );
+
     StaticElements {
         cpu_group_id,
         storage_group_id,
@@ -253,6 +316,7 @@ fn register_static_elements(registry: &mut ElementRegistry) -> StaticElements {
         physical_memory_id,
         swap_id,
         load_average_id,
+        log_collection_id,
     }
 }
 
@@ -277,7 +341,13 @@ struct Sampler {
     components: Components,
     previous_battery: Option<(i64, BatterySnapshot)>,
     process_network_available: bool,
+    /// Samples since the volumes were last listed.
+    samples_since_volume_list: u32,
 }
+
+/// Samples between two listings of the mounted volumes when no disk event
+/// asked for one (a new volume becomes an element at the latest then).
+const VOLUME_LIST_EVERY_SAMPLES: u32 = 30;
 
 impl Sampler {
     fn new(process_selector: ProcessSelector) -> Self {
@@ -301,6 +371,7 @@ impl Sampler {
             components,
             previous_battery: None,
             process_network_available: true,
+            samples_since_volume_list: 0,
         }
     }
 
@@ -312,7 +383,18 @@ impl Sampler {
         self.system.refresh_cpu_all();
         self.system.refresh_memory();
         self.system.refresh_processes(ProcessesToUpdate::All, true);
-        self.disks.refresh();
+        // A mount or unmount in the unified log (or the periodic listing)
+        // lists the volumes again, so a new volume becomes an element and
+        // its mount line can name it.
+        self.samples_since_volume_list += 1;
+        if ih_muse_macos::logs::take_volumes_changed()
+            || self.samples_since_volume_list >= VOLUME_LIST_EVERY_SAMPLES
+        {
+            self.disks.refresh_list();
+            self.samples_since_volume_list = 0;
+        } else {
+            self.disks.refresh();
+        }
         self.networks.refresh();
         self.components.refresh();
 
@@ -328,6 +410,7 @@ impl Sampler {
 
         CollectedSnapshot {
             poet_health: None,
+            log_stats: None,
             host: snapshot_from_values(
                 self.system.global_cpu_usage(),
                 self.system.used_memory(),
@@ -401,6 +484,8 @@ impl Sampler {
 /// over all of them); `emitted_processes` holds the keys published as leaves.
 struct CollectedSnapshot {
     poet_health: Option<PoetHealthSample>,
+    /// The unified log collector's counters (`None` when collection is off).
+    log_stats: Option<LogStats>,
     host: ih_muse_macos::HostSnapshot,
     cpu_cores: Vec<CpuCoreSample>,
     disks: Vec<DiskSample>,
@@ -969,6 +1054,15 @@ fn publish_snapshot(
         .load_metrics(now, static_elements.load_average_id)
     {
         payloads.push(payload);
+    }
+
+    if let Some(stats) = &snapshot.log_stats {
+        push_payload(
+            &mut payloads,
+            now,
+            static_elements.log_collection_id,
+            log_stats_readings(stats).into_iter().map(Some),
+        );
     }
 
     for (core, element_id) in snapshot.cpu_cores.iter().zip(registered.cpu_core_ids) {

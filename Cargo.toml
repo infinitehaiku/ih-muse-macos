@@ -11,6 +11,7 @@ reqwest = { version = "=0.12.8", features = ["json", "native-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 clap = { version = "4.5", features = ["derive", "env"] }
+libc = "0.2"
 ih-muse-client = { path = "../ih-muse/crates/ih-muse-client" }
 ih-muse-core = { path = "../ih-muse/crates/ih-muse-core" }
 ih-muse-proto = { path = "../ih-muse/crates/ih-muse-proto" }

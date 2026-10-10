@@ -76,11 +76,13 @@ pub fn host_dashboard() -> DashboardDefinition {
                 label: "Host: over time".into(),
                 text: None,
                 panels: ids(&["load", "disk", "swap", "battery"]),
+                ..Default::default()
             },
             DashboardBlock {
                 label: "Host: what uses the machine".into(),
                 text: Some("The busiest processes and applications, top 8 each.".into()),
                 panels: ids(&["top_cpu", "top_memory", "top_apps_cpu"]),
+                ..Default::default()
             },
         ],
         columns: Some(3),
@@ -97,11 +99,9 @@ fn panel(id: &str, title: &str, metric: &str, aggregation: PanelAggregation) -> 
         title: title.into(),
         metric: metric.into(),
         aggregation,
-        filters: Vec::new(),
-        group_by: None,
-        top_n: None,
-        signal: None,
-        thresholds: None,
+        // Time series at the kind's default size; new model fields keep
+        // their defaults so they never break this Muse again.
+        ..Default::default()
     }
 }
 

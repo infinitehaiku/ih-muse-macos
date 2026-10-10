@@ -14,12 +14,12 @@ use ih_muse_proto::{
     DashboardDefinition, EntityKey, GraphBatch, GraphIntakeRequest, InstrumentationScope, JoinStatus, MetricDefinition,
     MetricDescriptor, MetricDisplay, MetricId, MetricInstrument, MetricObservation, MetricPayload,
     MetricUnit, Number, Observation, OrganizationId, Provenance, RelationKind, SpatialAggregation,
-    TemporalRelation, TimeRange, TypedMetricValue, UnitDisplay, ValueDomain,
+    RatioBasis, TemporalRelation, TimeRange, TypedMetricValue, UnitDisplay, ValueDomain,
     GRAPH_CONTRACT_REVISION, GRAPH_INTAKE_CONTRACT_REVISION, GRAPH_INTAKE_SCHEMA_VERSION,
     GRAPH_SCHEMA_VERSION,
 };
 
-use crate::{KIND_MACOS_HOST, KIND_MACOS_PROCESS};
+use crate::{KIND_MACOS_HOST, KIND_MACOS_PROCESS, PROCESS_CPU_USAGE_METRIC};
 
 const SOURCE_ID: &str = "ih-muse-macos";
 
@@ -263,7 +263,15 @@ pub fn descriptor(definition: &MetricDefinition) -> MetricDescriptor {
         name: definition.code.clone(),
         description: definition.description.clone(),
         unit: MetricUnit { ucum: ucum.into(), display: unit_display },
-        value_domain: if display.unit == "boolean" { ValueDomain::Boolean } else { ValueDomain::Unbounded },
+        value_domain: if display.unit == "boolean" {
+            ValueDomain::Boolean
+        } else if definition.code == PROCESS_CPU_USAGE_METRIC {
+            // A percentage of one logical core (may exceed 100): Poet adds
+            // these as core-equivalents in app and host roll-ups.
+            ValueDomain::Ratio { basis: RatioBasis::SingleLogicalCore }
+        } else {
+            ValueDomain::Unbounded
+        },
         instrument,
         spatial_aggregation,
     }
@@ -290,6 +298,16 @@ mod tests {
             metadata(&[("pid", "42"), ("start_time", "1700000000")]),
         );
         (registry, host, cpu, process)
+    }
+
+    #[test]
+    fn process_cpu_is_a_percentage_of_one_logical_core_and_host_cpu_is_not() {
+        let definitions = metric_definitions();
+        let domain = |code: &str| {
+            descriptor(definitions.iter().find(|definition| definition.code == code).expect("declared")).value_domain
+        };
+        assert_eq!(domain(PROCESS_CPU_USAGE_METRIC), ValueDomain::Ratio { basis: RatioBasis::SingleLogicalCore });
+        assert_eq!(domain(CPU_USAGE_METRIC), ValueDomain::Unbounded);
     }
 
     #[test]
